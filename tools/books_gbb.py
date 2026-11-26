@@ -9,8 +9,11 @@
   * PDF 归属"从它所在目录往上找、最近的那个含 index.md 的目录"（可以找到 cwd 之上，
     但扫描不会把 cwd 之外的 PDF 拉进来）；
   * 一个 PDF 一个 tag：<目录名>__<文件名去扩展>__<YYYYMMDD-HHMM>；
-  * 账本 ../.books-releases.json 记 {PDF 相对路径: {sha256, tag, url, uploaded_at}}，
-    sha256 没变就跳过（不重传、不改 index.md）；
+  * 账本 ../.books-releases.json 记
+    {PDF 相对路径: {sha256, tag, url, size, asset_size, last_remote_state, uploaded_at}}；
+  * **账本只是"上次以为成功"的线索，远端才是事实**：sha256 没变也要先
+    `gh release view` 核对 release / 资产 / 大小（草稿也算没传好），对不上就补传；
+    默认核对，`--no-verify` 才只信账本；
   * 只把托管块（books:downloads:begin … end）写进 index.md，块外一个字不动；
   * --pull：按账本 + index.md 托管块，把当前目录范围内本地缺失的 PDF 下载回来，
     不改 index.md、不提交、不推送。
@@ -28,7 +31,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -40,6 +43,9 @@ DEFAULT_BRANCH = "main"
 MAX_TAG_LEN = 100
 MAX_RELEASE_BYTES = 2 * 1024 ** 3  # GitHub Release 单文件 2GB 上限
 URL_TMPL = "https://github.com/{repo}/releases/tag/{tag}"
+# `gh release view` 对"release 不存在"的说法：stderr 一行 `release not found`，
+# 或者 HTTP 404。别把网络 / 权限错误也当成"没有 release"，那是两回事。
+NOT_FOUND_RE = re.compile(r"(?:\b404\b|not found)", re.IGNORECASE)
 
 DEBUG = False
 
@@ -58,8 +64,12 @@ class Item:
     size: int
     tag: str
     url: str
-    kind: str         # new / changed / skip
+    kind: str         # new / changed / reupload / skip
+    reason: str = ""          # reupload 的人话原因（进计划、提交信息）
     old: dict | None = None
+    is_draft: bool = False
+    upload_mode: str = "unknown"   # create / upload / unknown（规划阶段已知的补传路径）
+    verify_label: str = ""         # skip 时：空 = 真跳过；--no-verify = 没核对
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +234,132 @@ def used_tags(root: Path, ledger: dict) -> set[str]:
             if isinstance(prev, dict) and prev.get("tag"):
                 tags.add(prev["tag"])
     return tags
+
+
+# ---------------------------------------------------------------------------
+# 远端核对（gh release view）—— 账本只当线索，远端才是事实
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RemoteRelease:
+    state: str                 # ok / no-release / error
+    detail: str = ""
+    is_draft: bool = False
+    assets: list = field(default_factory=list)
+
+
+@dataclass
+class RemoteCheck:
+    state: str                 # ok / no-release / no-asset / size-mismatch / draft / error
+    detail: str = ""
+    exists: bool = False
+    is_draft: bool = False
+    has_asset: bool = False
+    asset_name: str = ""
+    asset_size: int | None = None
+
+
+def asset_name_key(name: str) -> str:
+    """GitHub 会把资产名里 [A-Za-z0-9._-] 之外的字符换成 '.'。
+
+    实测：本地 `INTEL 80386 PROGRAMMER'S REFERENCE MANUAL 1986.pdf` 上传后，
+    远端资产名是 `INTEL.80386.PROGRAMMER.S.REFERENCE.MANUAL.1986.pdf`。
+    所以"按文件名匹配"要先做同样的归一化。
+    """
+    return "".join(ch if (ch.isalnum() or ch in ".-_") else "." for ch in name)
+
+
+def find_asset(assets: list, filename: str) -> dict | None:
+    """在 assets[] 里按文件名找资产：先精确匹配，再按 GitHub 的归一化名匹配。"""
+    for asset in assets:
+        if isinstance(asset, dict) and asset.get("name") == filename:
+            return asset
+    target = asset_name_key(filename)
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        if asset_name_key(str(asset.get("name") or "")) == target:
+            return asset
+    return None
+
+
+def fetch_remote_release(repo: str, tag: str) -> RemoteRelease:
+    """读 `gh release view <tag> --repo <repo> --json tagName,assets,isDraft`。
+
+    只读。三种结果分清楚：
+      * ok         —— release 在（是不是草稿看 is_draft）；
+      * no-release —— gh 明确说 release 不存在；
+      * error      —— 网络 / 权限 / 输出坏了：调用方必须按"未上传"处理，不能静默跳过。
+    """
+    try:
+        proc = run(["gh", "release", "view", tag, "--repo", repo,
+                    "--json", "tagName,assets,isDraft"])
+    except ToolError as exc:
+        return RemoteRelease("error", str(exc))
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        if NOT_FOUND_RE.search(detail):
+            return RemoteRelease("no-release", detail or "release not found")
+        return RemoteRelease("error", detail or f"gh release view 退出码 {proc.returncode}")
+    raw = proc.stdout.strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return RemoteRelease("error", f"gh release view 输出不是合法 JSON：{raw[:200]!r}")
+    if not isinstance(data, dict):
+        return RemoteRelease("error", "gh release view 输出的 JSON 顶层不是对象")
+    assets = data.get("assets")
+    if not isinstance(assets, list):
+        return RemoteRelease("error", "gh release view 输出里没有 assets 数组")
+    return RemoteRelease("ok", "", bool(data.get("isDraft")), assets)
+
+
+def check_remote_asset(repo: str, tag: str, filename: str,
+                       local_size: int | None = None) -> RemoteCheck:
+    """核对远端 release 里有没有这个文件、大小对不对。
+
+    local_size=None 表示本地没有这个文件（--pull 用），此时只核对存在性。
+    草稿一律返回 draft（草稿的下载链接对别人不可用，不能算"已传好"）。
+    """
+    meta = fetch_remote_release(repo, tag)
+    if meta.state == "error":
+        return RemoteCheck("error", meta.detail)
+    if meta.state == "no-release":
+        return RemoteCheck("no-release", meta.detail)
+    asset = find_asset(meta.assets, filename)
+    if asset is None:
+        detail = ("release 是草稿且没有资产" if meta.is_draft
+                  else f"release 里没有 {filename!r}")
+        return RemoteCheck("draft" if meta.is_draft else "no-asset", detail,
+                           exists=True, is_draft=meta.is_draft)
+    remote_name = str(asset.get("name") or filename)
+    try:
+        remote_size = int(asset.get("size"))
+    except (TypeError, ValueError):
+        return RemoteCheck(
+            "error",
+            f"远端资产 {remote_name!r} 的 size 不是整数：{asset.get('size')!r}",
+            exists=True, is_draft=meta.is_draft, has_asset=True, asset_name=remote_name,
+        )
+    if meta.is_draft:
+        if local_size is not None and remote_size != local_size:
+            detail = (f"release 是草稿（资产大小也不一致：本地 {human_size(local_size)}，"
+                      f"远端 {human_size(remote_size)}）")
+        else:
+            detail = "release 是草稿（未发布）"
+        return RemoteCheck("draft", detail, exists=True, is_draft=True, has_asset=True,
+                           asset_name=remote_name, asset_size=remote_size)
+    if local_size is None:
+        return RemoteCheck("ok", f"远端资产 {human_size(remote_size)}",
+                           exists=True, has_asset=True, asset_name=remote_name,
+                           asset_size=remote_size)
+    if remote_size == local_size:
+        return RemoteCheck("ok", f"{human_size(remote_size)}", exists=True, has_asset=True,
+                           asset_name=remote_name, asset_size=remote_size)
+    return RemoteCheck("size-mismatch",
+                       f"本地 {human_size(local_size)}，远端 {human_size(remote_size)}",
+                       exists=True, has_asset=True, asset_name=remote_name,
+                       asset_size=remote_size)
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +598,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="扫描整个仓库（默认只扫描当前工作目录及其子目录）")
     parser.add_argument("--yes", action="store_true",
                         help="跳过所有询问（两处都按默认答案执行）")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="跳过远端核对，只信本地账本（默认每次都会 gh release view 核对远端）")
     parser.add_argument("--repo", default=DEFAULT_REPO,
                         help=f"GitHub 仓库 owner/name（默认 {DEFAULT_REPO}）")
     parser.add_argument("--branch", default=DEFAULT_BRANCH,
@@ -474,21 +612,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
-def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.Namespace,
-               index_changes: dict[Path, str], ledger_changed: bool) -> None:
+def item_status_text(item: Item) -> str:
+    """计划里每个 PDF 的方括号状态。"""
+    if item.kind == "new":
+        return "新增"
+    if item.kind == "changed":
+        return "变更"
+    if item.kind == "reupload":
+        return f"需补传：{item.reason}"
+    if item.verify_label == "--no-verify":
+        return "跳过（未核对远端，--no-verify）"
+    return "跳过"
+
+
+def print_items(items: list[Item]) -> None:
     print(f"扫描到 {len(items)} 个 PDF：")
     for item in items:
-        if item.kind == "new":
-            status = "新增"
-        elif item.kind == "changed":
-            status = "变更"
-        else:
-            status = "跳过（sha256 未变）"
-        print(f"  [{status}] {item.rel}")
+        print(f"  [{item_status_text(item)}] {item.rel}")
         print(f"         归属：{item.index_rel}")
-        print(f"         tag ：{item.tag}")
+        if item.kind == "reupload":
+            print(f"         tag ：{item.tag}（补传继续用这个旧 tag，不新建）")
+        else:
+            print(f"         tag ：{item.tag}")
         if item.kind == "changed" and item.old and item.old.get("tag"):
             print(f"         旧 tag：{item.old['tag']}（保留在 GitHub 上，不删）")
+
+
+def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.Namespace,
+               index_changes: dict[Path, str], ledger_changed: bool) -> None:
+    print_items(items)
 
     print("\n计划写入：")
     for path in sorted(index_changes, key=lambda p: rel_posix(p, root)):
@@ -502,14 +654,26 @@ def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.N
     print(f"  git -C {root} commit -F <提交信息> -- {' '.join(rels)}")
     print(f"  git -C {root} push origin {args.branch}")
     for item in todo:
-        print(f"  gh release view {item.tag} --repo {args.repo}   # 判断 tag 有没有被占")
-        print(f"  gh release create {item.tag} <pdf> --repo {args.repo}  # 已存在则改 upload --clobber")
+        if item.upload_mode == "upload":
+            print(f"  gh release upload {item.tag} <pdf> --repo {args.repo} --clobber")
+        elif item.upload_mode == "create":
+            print(f"  gh release create {item.tag} <pdf> --repo {args.repo}  # release 不存在，直接建")
+        else:
+            print(f"  gh release view {item.tag} --repo {args.repo}   # 判断 release 是否已存在")
+            print(f"  gh release create {item.tag} <pdf> --repo {args.repo}  # 不存在则建")
+            print(f"  #   已存在则改用 gh release upload {item.tag} <pdf> --repo {args.repo} --clobber")
+        if item.is_draft:
+            print(f"  gh release edit {item.tag} --repo {args.repo} --draft=false   # 把草稿发布出去")
 
 
 def build_commit_message(todo: list[Item]) -> str:
     new_items = [it for it in todo if it.kind == "new"]
     changed_items = [it for it in todo if it.kind == "changed"]
-    lines = [f"books: 发布 {len(todo)} 个 PDF 到 Release", ""]
+    reupload_items = [it for it in todo if it.kind == "reupload"]
+    if reupload_items and not new_items and not changed_items:
+        lines = [f"books: 补传 {len(reupload_items)} 个 PDF 到 Release", ""]
+    else:
+        lines = [f"books: 发布 {len(todo)} 个 PDF 到 Release", ""]
     if new_items:
         lines.append(f"新增 {len(new_items)} 个：")
         for item in new_items:
@@ -522,6 +686,13 @@ def build_commit_message(todo: list[Item]) -> str:
         for item in changed_items:
             lines.append(f"- {item.rel}")
             lines.append(f"  tag: {item.tag}（旧 tag: {item.old.get('tag') if item.old else '无'}）")
+    if reupload_items:
+        if new_items or changed_items:
+            lines.append("")
+        lines.append(f"补传 {len(reupload_items)} 个（复用账本里的旧 tag）：")
+        for item in reupload_items:
+            lines.append(f"- {item.rel}")
+            lines.append(f"  tag: {item.tag}（{item.reason}）")
     lines.append("")
     lines.append("index.md 的「下载链接」块由 books/gbb 自动生成，别手改。")
     return "\n".join(lines) + "\n"
@@ -543,21 +714,48 @@ def do_uploads(args: argparse.Namespace, root: Path, todo: list[Item]) -> list[t
             f"sha256：{item.sha[:12]}"
         )
         title = f"{dir_label(item.pdf.parent, root)} / {item.pdf.name}"
-        exists = run(["gh", "release", "view", item.tag, "--repo", args.repo]).returncode == 0
-        if exists:
-            print(f"  tag 已存在，改用 gh release upload --clobber（不重建 release）")
+
+        # 走 create 还是 upload：规划阶段已经核对过的直接沿用；不知道的（新增/变更、
+        # 或核对失败的）上传前再核一次。--no-verify = 只信账本，新 tag 直接 create。
+        mode = item.upload_mode
+        is_draft = item.is_draft
+        if mode == "unknown":
+            if args.no_verify:
+                mode = "create"
+            else:
+                meta = fetch_remote_release(args.repo, item.tag)
+                if meta.state == "ok":
+                    mode, is_draft = "upload", meta.is_draft
+                elif meta.state == "no-release":
+                    mode, is_draft = "create", False
+                else:
+                    print("  ⚠️ 上传前核对远端失败，按尚未上传处理（尝试 create）："
+                          f"{meta.detail or '（gh 没输出原因）'}")
+                    mode, is_draft = "create", False
+
+        if mode == "upload":
+            print("  release 已存在，改用 gh release upload --clobber（不重建 release）")
             cmd = ["gh", "release", "upload", item.tag, item.pdf, "--repo", args.repo, "--clobber"]
         else:
             cmd = ["gh", "release", "create", item.tag, item.pdf, "--repo", args.repo,
                    "--title", title, "--notes", notes]
         proc = run(cmd)
-        if proc.returncode == 0:
-            print(f"  完成：{item.url}")
-        else:
+        if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip()
             print(f"  失败：{detail or '（gh 没输出原因）'}")
             failures.append((item, detail or "gh 返回非 0"))
             break  # 多半是登录/权限/网络问题，后面的不再硬试
+        if is_draft:
+            print("  release 是草稿，上传完成后发布：gh release edit --draft=false")
+            edit = run(["gh", "release", "edit", item.tag, "--repo", args.repo,
+                        "--draft=false"])
+            if edit.returncode != 0:
+                detail = (edit.stderr or edit.stdout).strip()
+                print(f"  失败：文件传上去了，但草稿没能发布：{detail or '（gh 没输出原因）'}")
+                print("  草稿没有公开，下载链接对别人仍然不可用；没有留半成品，重跑会再补。")
+                failures.append((item, f"草稿发布失败：{detail or 'gh 返回非 0'}"))
+                break
+        print(f"  完成：{item.url}")
     return failures
 
 
@@ -594,22 +792,26 @@ def index_files_covering(scan_root: Path, root: Path) -> list[Path]:
 
 
 def collect_pull_records(root: Path, scan_root: Path, ledger: dict) -> dict[str, dict]:
-    """账本 + index.md 托管块 -> {rel: {tags: [...], sources: [...]}}，只留 cwd 子树内的。"""
+    """账本 + index.md 托管块 -> {rel: {tags, sources, size}}，只留 cwd 子树内的。"""
     records: dict[str, dict] = {}
 
-    def add(rel: str, tag: str, source: str) -> None:
+    def add(rel: str, tag: str, source: str, size: int | None = None) -> None:
         if not is_under(root / rel, scan_root):
             return
-        info = records.setdefault(rel, {"tags": [], "sources": []})
+        info = records.setdefault(rel, {"tags": [], "sources": [], "size": None})
         if tag and tag not in info["tags"]:
             info["tags"].append(tag)
         if source not in info["sources"]:
             info["sources"].append(source)
+        if size is not None and info.get("size") is None:
+            info["size"] = size
 
     for rel, value in sorted(ledger.items()):
         if not isinstance(value, dict):
             continue
-        add(rel, value.get("tag") or "", LEDGER_NAME)
+        size = value.get("size")
+        add(rel, value.get("tag") or "", LEDGER_NAME,
+            size if isinstance(size, int) and not isinstance(size, bool) else None)
 
     for index_md in index_files_covering(scan_root, root):
         try:
@@ -646,52 +848,95 @@ def do_pull(args: argparse.Namespace, root: Path, scan_root: Path, ledger: dict)
         return 0
 
     print(f"发现 {len(missing)} 个缺失：")
-    jobs: list[tuple[str, str, Path, list[str] | None]] = []
+    jobs: list[tuple[str, str, Path, list[str] | None, str]] = []
+    remote_missing: list[tuple[str, str, str]] = []
+    pull_warnings: list[tuple[str, str]] = []
     for rel in sorted(missing):
         info = records[rel]
         tag = info["tags"][0] if info["tags"] else ""
         note = ""
         if len(info["tags"]) > 1:
             note = f"  ⚠️ 账本/index.md 的 tag 不一致：{' / '.join(info['tags'])}"
+        target_dir = (root / rel).parent
+        # 没核对到远端资产名时，按 GitHub 的归一化规则猜资产名（空格/引号变 '.'）；
+        # 猜对了 --pattern 才能命中，下载后再改回本地文件名。
+        pattern = asset_name_key(Path(rel).name)
+        if tag and not args.no_verify:
+            # 账本说"上传过"不算数：远端真有这个资产才 pull，否则报"远端也没有"。
+            check = check_remote_asset(args.repo, tag, Path(rel).name, info.get("size"))
+            if check.state == "no-release":
+                print(f"  [远端也没有] {rel}  ← {tag}{note}")
+                print("        账本说上传过，但远端没有这个 release，不能 pull。")
+                remote_missing.append((rel, tag, "远端没有这个 release"))
+                continue
+            if check.state in ("no-asset", "draft") and not check.has_asset:
+                print(f"  [远端也没有] {rel}  ← {tag}{note}")
+                print(f"        账本说上传过，但{check.detail}，不能 pull。")
+                remote_missing.append((rel, tag, check.detail))
+                continue
+            if check.state == "draft":
+                pull_warnings.append(
+                    (rel, f"{check.detail}；下载链接对别人不可用，仍尝试下载"))
+            elif check.state == "size-mismatch":
+                pull_warnings.append(
+                    (rel, f"远端资产大小与账本记录不一致（{check.detail}），仍尝试下载"))
+            elif check.state == "error":
+                pull_warnings.append(
+                    (rel, f"远端核对失败，按记录尝试下载（{check.detail or 'gh 没输出原因'}）"))
+            if check.has_asset and check.asset_name:
+                # GitHub 会把资产名里的空格 / 引号换成 '.'，--pattern 要用远端那个名字。
+                pattern = check.asset_name
         if tag:
             print(f"  [缺失] {rel}  ← {tag}{note}")
         else:
             print(f"  [缺失] {rel}  ← （没有 tag，无法下载）{note}")
-        target_dir = (root / rel).parent
         cmd = None
         if tag:
             cmd = ["gh", "release", "download", tag, "--repo", args.repo,
-                   "--pattern", Path(rel).name, "--dir", str(target_dir), "--clobber"]
-        jobs.append((rel, tag, target_dir, cmd))
+                   "--pattern", pattern, "--dir", str(target_dir), "--clobber"]
+        jobs.append((rel, tag, target_dir, cmd, pattern))
+
+    for rel, text in pull_warnings:
+        print(f"  ⚠️ {rel}：{text}")
 
     if args.dry_run:
-        print("\n将执行：")
-        for rel, _tag, _target_dir, cmd in jobs:
-            if cmd is None:
-                print(f"  # {rel}：没有 tag，跳过")
-            else:
-                print("  " + " ".join(shlex.quote(c) for c in cmd))
+        if jobs:
+            print("\n将执行：")
+            for rel, _tag, _target_dir, cmd, _name in jobs:
+                if cmd is None:
+                    print(f"  # {rel}：没有 tag，跳过")
+                else:
+                    print("  " + " ".join(shlex.quote(c) for c in cmd))
+        if remote_missing:
+            print(f"\n其中 {len(remote_missing)} 个远端也没有，不能 pull：")
+            for rel, tag, reason in remote_missing:
+                print(f"  ✗ {rel}（tag {tag}）：{reason}")
         print("\n[dry-run] 没有下载任何文件。")
         return 0
 
-    print()
-    if not confirm(
-        f"现在下载这 {len(jobs)} 个缺失文件？（只放回本地；不改 index.md、不提交）",
-        default_yes=True,
-        assume_yes=args.yes,
-    ):
-        print("已取消，没有下载任何文件。")
-        return 0
+    if jobs:
+        print()
+        if not confirm(
+            f"现在下载这 {len(jobs)} 个缺失文件？（只放回本地；不改 index.md、不提交）",
+            default_yes=True,
+            assume_yes=args.yes,
+        ):
+            print("已取消，没有下载任何文件。")
+            return 0
 
     print()
     ok = 0
-    failures: list[tuple[str, str]] = []
-    for num, (rel, _tag, target_dir, cmd) in enumerate(jobs, 1):
+    failures: list[tuple[str, str]] = [
+        (rel, f"远端也没有：{reason}") for rel, _tag, reason in remote_missing
+    ]
+    download_failures: list[tuple[str, str]] = []
+    for num, (rel, _tag, target_dir, cmd, download_name) in enumerate(jobs, 1):
         print(f"[{num}/{len(jobs)}] {rel}")
         if cmd is None:
             reason = "记录里没有 tag（账本和 index.md 托管块都没给 release 链接）"
             print(f"  失败：{reason}")
             failures.append((rel, reason))
+            download_failures.append((rel, reason))
             continue
         print("  $ " + " ".join(shlex.quote(c) for c in cmd))
         try:
@@ -700,8 +945,22 @@ def do_pull(args: argparse.Namespace, root: Path, scan_root: Path, ledger: dict)
         except ToolError as exc:
             print(f"  失败：{exc}")
             failures.append((rel, str(exc)))
+            download_failures.append((rel, str(exc)))
             continue
         target = root / rel
+        downloaded = target_dir / download_name
+        if (proc.returncode == 0 and not target.is_file()
+                and downloaded.is_file() and downloaded != target):
+            # GitHub 的资产名会把空格 / 引号换成 '.'，--dir 下载后是按资产名落盘的；
+            # 这里改回 index.md / 账本里记的本地文件名。
+            try:
+                os.replace(downloaded, target)
+            except OSError as exc:
+                reason = f"下载成功但改名失败：{exc}"
+                print(f"  失败：{reason}")
+                failures.append((rel, reason))
+                download_failures.append((rel, reason))
+                continue
         if proc.returncode == 0 and target.is_file():
             print(f"  完成：{rel}（{human_size(target.stat().st_size)}）")
             ok += 1
@@ -709,14 +968,22 @@ def do_pull(args: argparse.Namespace, root: Path, scan_root: Path, ledger: dict)
             detail = (proc.stderr or proc.stdout).strip() or f"gh 退出码 {proc.returncode}"
             print(f"  失败：{detail}")
             failures.append((rel, detail))
+            download_failures.append((rel, detail))
 
     print("\n==== 总账（--pull）====")
     print(f"成功 {ok} / 失败 {len(failures)} / 本来就在本地 {len(present)}")
-    if failures:
-        for rel, reason in failures:
+    if remote_missing:
+        print(f"\n{len(remote_missing)} 个记录远端也没有资产，不能 pull：")
+        for rel, tag, reason in remote_missing:
+            print(f"  ✗ {rel}（tag {tag}）：{reason}")
+        print("  账本说上传过，但远端 release 里查不到对应资产；")
+        print("  先在能上传的机器上跑 ./gbb 补传（或把这条从账本里删掉），再 --pull。")
+    if download_failures:
+        for rel, reason in download_failures:
             print(f"  ✗ {rel}：{reason}")
         print_gh_troubleshooting(args.repo, "下载")
         print("下载失败的文件没有放回本地；修好后重跑 ./gbb --pull 即可。")
+    if failures:
         return 1
     print("\n全部下载完成。index.md 和账本没有改动，也没有提交/推送。")
     return 0
@@ -804,38 +1071,92 @@ def _main(args: argparse.Namespace) -> int:
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
 
+    remote_warnings: list[tuple[Item, str]] = []
+    noverify_warnings: list[tuple[Item, str]] = []
     items: list[Item] = []
     for pdf, index_dir in sorted(rows, key=lambda row: rel_posix(row[0], root)):
         rel = rel_posix(pdf, root)
         sha = sha256_file(pdf)
         size = pdf.stat().st_size
         old = ledger.get(rel) if isinstance(ledger.get(rel), dict) else None
-        if old and old.get("sha256") == sha and old.get("tag"):
-            kind = "skip"
-            tag = old["tag"]
-            url = old.get("url") or url_for(args.repo, tag)
-        else:
-            kind = "changed" if old and old.get("sha256") else "new"
-            tag = make_tag(index_dir, pdf, stamp, tags)
-            tags.add(tag)
-            url = url_for(args.repo, tag)
-        items.append(Item(
+        item = Item(
             pdf=pdf,
             rel=rel,
             index_dir=index_dir,
             index_rel=rel_posix(index_dir / "index.md", root),
             sha=sha,
             size=size,
-            tag=tag,
-            url=url,
-            kind=kind,
+            tag="",
+            url="",
+            kind="",
             old=old,
-        ))
+        )
+        if old and old.get("sha256") == sha and old.get("tag"):
+            # 账本说"上传过"只是线索：默认必须去远端核对，账本不当事实。
+            tag = old["tag"]
+            item.tag = tag
+            item.url = old.get("url") or url_for(args.repo, tag)
+            if args.no_verify:
+                item.kind = "skip"
+                item.verify_label = "--no-verify"
+                last_state = str(old.get("last_remote_state") or "").strip()
+                if last_state != "published":
+                    noverify_warnings.append((item, last_state or "未知（账本里没记）"))
+            else:
+                check = check_remote_asset(args.repo, tag, pdf.name, size)
+                item.is_draft = check.is_draft
+                if check.state == "ok":
+                    item.kind = "skip"
+                else:
+                    item.kind = "reupload"
+                    if check.state == "no-release":
+                        item.reason = "远端没有 release"
+                        item.upload_mode = "create"
+                    elif check.state == "no-asset":
+                        item.reason = "release 里没有这个文件"
+                        item.upload_mode = "upload"
+                    elif check.state == "size-mismatch":
+                        item.reason = "大小不一致"
+                        item.upload_mode = "upload"
+                    elif check.state == "draft":
+                        item.reason = check.detail
+                        item.upload_mode = "upload"
+                    else:  # error：网络 / 权限 / 输出坏了
+                        item.reason = "远端核对失败，按未上传处理"
+                        item.upload_mode = "unknown"
+                        remote_warnings.append((item, check.detail))
+        else:
+            item.kind = "changed" if old and old.get("sha256") else "new"
+            item.tag = make_tag(index_dir, pdf, stamp, tags)
+            tags.add(item.tag)
+            item.url = url_for(args.repo, item.tag)
+            item.upload_mode = "create" if args.no_verify else "unknown"
+        items.append(item)
+
+    if remote_warnings:
+        print(f"\n⚠️ 远端核对失败 {len(remote_warnings)} 个（按未上传处理，仍会上传）：")
+        for item, detail in remote_warnings:
+            print(f"  - {item.rel}")
+            print(f"    原因：{detail or '（gh 没输出原因）'}")
+            print("    处理：远端核对失败，按未上传处理（宁可重传，也不留死链）。")
+    if noverify_warnings:
+        print(f"\n⚠️ --no-verify：{len(noverify_warnings)} 个 PDF 没有核对远端，只按账本跳过：")
+        for item, state in noverify_warnings:
+            print(f"  - {item.rel}（账本上次记的远端状态：{state}）")
+        print("    如果是草稿 / 未知，下载链接可能对别人仍然不可用；")
+        print("    要确认就去掉 --no-verify 重跑，或手动 gh release view 看一眼。")
 
     todo = [it for it in items if it.kind != "skip"]
     skipped = len(items) - len(todo)
     if not todo:
-        print(f"\n全部已是最新：{len(items)} 个 PDF 的 sha256 都没变，跳过 {skipped} 个。")
+        print()
+        print_items(items)
+        if any(it.verify_label == "--no-verify" for it in items):
+            print(f"\n全部已是最新：{len(items)} 个 PDF 的 sha256 都没变，"
+                  f"按账本跳过 {skipped} 个（--no-verify，未核对远端）。")
+        else:
+            print(f"\n全部已是最新：{len(items)} 个 PDF 的 sha256 都没变，"
+                  f"远端核对通过，跳过 {skipped} 个。")
         print("没有改 index.md，也没有提交或上传。")
         return 0
 
@@ -869,22 +1190,42 @@ def _main(args: argparse.Namespace) -> int:
             index_changes[index_md] = new_text
 
     ledger_new = copy.deepcopy(ledger)
+    # 远端核对通过的跳过项：顺手把 size / asset_size / last_remote_state 补进账本，
+    # 以后 --no-verify 离线判断才有数据可用（sha/tag/url/uploaded_at 一律不动）。
+    for item in items:
+        if item.kind != "skip" or item.verify_label == "--no-verify":
+            continue
+        entry = ledger_new.get(item.rel)
+        if not isinstance(entry, dict):
+            continue
+        entry["size"] = item.size
+        entry["asset_size"] = item.size
+        entry["last_remote_state"] = "published"
     for item in todo:
         entry = {
             "sha256": item.sha,
             "tag": item.tag,
             "url": item.url,
+            # size = 本地字节数；asset_size = 这次上传/补传后远端资产应有的字节数
+            # （成功即等于 size；失败会整轮回滚）。给以后 --no-verify 离线判断用。
+            "size": item.size,
+            "asset_size": item.size,
+            "last_remote_state": "published",
             "uploaded_at": now_iso,
         }
         old = item.old
         if old and old.get("sha256") and old.get("sha256") != item.sha:
             previous = list(old.get("previous") or [])
-            previous.append({
+            prev_entry = {
                 "sha256": old.get("sha256"),
                 "tag": old.get("tag"),
                 "url": old.get("url"),
                 "uploaded_at": old.get("uploaded_at"),
-            })
+            }
+            for key in ("size", "asset_size", "last_remote_state"):
+                if old.get(key) is not None:
+                    prev_entry[key] = old[key]
+            previous.append(prev_entry)
             entry["previous"] = previous
         ledger_new[item.rel] = entry
     new_ledger_raw = ledger_text(ledger_new).encode("utf-8")
