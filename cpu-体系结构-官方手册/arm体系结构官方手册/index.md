@@ -31,5 +31,5 @@
 
 <!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
 # 下载链接
-1. [DDI0487L_b_a-profile_architecture_reference_manual.pdf](https://github.com/allinkernel/wblog-books/releases/tag/arm体系结构官方手册__DDI0487L_b_a-profile_architecture_reference_manual__20261126-1411) · 106.5 MB · sha256:b60408f5
+1. [DDI0487L_b_a-profile_architecture_reference_manual.pdf](https://github.com/allinkernel/wblog-books/releases/tag/arm体系结构官方手册__DDI0487L_b_a-profile_architecture_reference_manual__20261126-1411) · 106.5 MB · sha256:b60408f5 · 2026-11-26 10:33
 <!-- books:downloads:end -->
