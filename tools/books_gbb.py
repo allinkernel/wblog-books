@@ -15,6 +15,11 @@
     `gh release view` 核对 release / 资产 / 大小（草稿也算没传好），对不上就补传；
     默认核对，`--no-verify` 才只信账本；
   * 只把托管块（books:downloads:begin … end）写进 index.md，块外一个字不动；
+    块里每行带「大小 + sha256 前 8 位」（完整 hash 在账本里），改 PDF → 新 tag；
+    旧 release 不删，要找回旧版就 `git show <旧提交>:index.md` 拿旧 tag；
+  * 上传资产优先用 `curl -T … --progress-bar`（真实进度条，token 只走 stdin），
+    没有 curl / 不是交互式终端 / curl 失败 → 自动退回
+    `gh release upload --clobber`（并说明这次没有进度条，不编造进度）；
   * --pull：按账本 + index.md 托管块，把当前目录范围内本地缺失的 PDF 下载回来，
     不改 index.md、不提交、不推送。
 """
@@ -28,12 +33,15 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 BEGIN_MARK = "<!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->"
 END_MARK = "<!-- books:downloads:end -->"
@@ -43,6 +51,11 @@ DEFAULT_BRANCH = "main"
 MAX_TAG_LEN = 100
 MAX_RELEASE_BYTES = 2 * 1024 ** 3  # GitHub Release 单文件 2GB 上限
 URL_TMPL = "https://github.com/{repo}/releases/tag/{tag}"
+# 上传资产走 GitHub 的 uploads 域名（不是 api.github.com）；release id 先建空 release 拿到。
+UPLOAD_API_TMPL = "https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}"
+# 实测上传带宽 ≈0.16–0.23 MB/s（下载 2.6–4.8 MB/s）。只用于"大约还要多久"的**估算**，
+# 绝不拿它编造真实进度：拿不到 curl 的真实进度条时就明说没有进度条。
+UPLOAD_EST_BYTES_PER_SEC = 0.2 * 1000 * 1000
 # `gh release view` 对"release 不存在"的说法：stderr 一行 `release not found`，
 # 或者 HTTP 404。别把网络 / 权限错误也当成"没有 release"，那是两回事。
 NOT_FOUND_RE = re.compile(r"(?:\b404\b|not found)", re.IGNORECASE)
@@ -114,6 +127,49 @@ def human_size(num: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{num} B"
+
+
+def human_size_mb(num: int) -> str:
+    """十进制大小，和 GitHub release 页 / 下载器显示的口径一致（52.1 MB）。
+
+    index.md 托管块里用这个（用户看到的就是 release 页上的那个数）；
+    计划 / 日志里仍用 human_size() 的 MiB，别把两套口径混着改。
+    """
+    value = float(num)
+    if value < 1000:
+        return f"{int(value)} B"
+    if value < 1000 ** 2:
+        return f"{value / 1000:.1f} KB"
+    if value < 1000 ** 3:
+        return f"{value / 1000 ** 2:.1f} MB"
+    return f"{value / 1000 ** 3:.2f} GB"
+
+
+def elapsed_text(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f} 秒"
+    total = int(round(seconds))
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {sec} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes} 分"
+
+
+def upload_speed_text(size: int, seconds: float) -> str:
+    if seconds <= 0:
+        return "速度未知"
+    return f"{size / 1e6 / seconds:.2f} MB/s"
+
+
+def upload_eta_text(size: int) -> str:
+    """按实测 0.2 MB/s 估一个"大约多久"，只是给等的人一个心理预期。"""
+    seconds = size / UPLOAD_EST_BYTES_PER_SEC
+    if seconds < 90:
+        return f"约需 {seconds:.0f} 秒"
+    if seconds < 3600:
+        return f"约需 {seconds / 60:.0f} 分钟"
+    return f"约需 {seconds / 3600:.1f} 小时"
 
 
 def sha256_file(path: Path) -> str:
@@ -388,44 +444,64 @@ def ledger_text(ledger: dict) -> str:
     return json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
-ITEM_LINE_RE = re.compile(r"^\s*\d+\.\s+\[(.*)\]\((\S+)\)\s*$")
+ITEM_LINE_RE = re.compile(
+    r"^\s*\d+\.\s+\[(.*)\]\((\S+)\)(?:\s+(.*?))?\s*$"
+)
 
 
-def parse_block_items(text: str) -> list[tuple[str, str]] | None:
-    """读出托管块里的 [(label, url)]；没有 begin 标记返回 None，空块返回 []。"""
+@dataclass
+class BlockEntry:
+    """index.md 托管块里的一行：`N. [label](url) · 大小 · sha256:xxxxxxxx`。"""
+
+    label: str
+    url: str
+    extra: str = ""   # 链接后面那段（大小 / hash）；旧格式的行可能为空，原样保留
+
+
+def parse_block_items(text: str) -> list[BlockEntry] | None:
+    """读出托管块里的条目；没有 begin 标记返回 None，空块返回 []。"""
     if BEGIN_MARK not in text:
         return None
     if END_MARK not in text:
         return []
     start = text.index(BEGIN_MARK) + len(BEGIN_MARK)
     end = text.index(END_MARK, start)
-    entries: list[tuple[str, str]] = []
+    entries: list[BlockEntry] = []
     for line in text[start:end].splitlines():
         match = ITEM_LINE_RE.match(line)
         if not match:
             continue
         label = match.group(1).replace("\\[", "[").replace("\\]", "]")
-        entries.append((label, match.group(2)))
+        extra = (match.group(3) or "").strip()
+        entries.append(BlockEntry(label, match.group(2), extra))
     return entries
 
 
 def render_block(items: list[Item], index_dir: Path,
-                 preserved: list[tuple[str, str, str]] = ()) -> str:
+                 preserved: list[tuple[str, BlockEntry]] = ()) -> str:
     """渲染托管块。
 
-    preserved 是 [(rel, label, url)]：扫描范围之外、但本来就记在这个 index.md 块里的
-    旧条目。cwd 之上的 index.md 被更新时用它保住范围外的链接，免得整块被覆盖掉。
+    每行：`N. [相对路径](release 链接) · <十进制大小> · sha256:<前 8 位>`
+    （完整 hash 在账本里；前 8 位够人肉核对，也够和 `sha256sum` 输出对照）。
+
+    preserved 是 [(rel, BlockEntry)]：扫描范围之外、但本来就记在这个 index.md 块里的
+    旧条目。cwd 之上的 index.md 被更新时用它保住范围外的链接和它们原来的大小/hash，
+    免得整块被覆盖掉。
     """
-    rows: dict[str, tuple[str, str]] = {}
+    rows: dict[str, tuple[str, str, str]] = {}
     for item in items:
-        rows[item.rel] = (rel_posix(item.pdf, index_dir), item.url)
-    for rel, label, url in preserved:
-        rows.setdefault(rel, (label, url))
+        extra = f"· {human_size_mb(item.size)} · sha256:{item.sha[:8]}"
+        rows[item.rel] = (rel_posix(item.pdf, index_dir), item.url, extra)
+    for rel, entry in preserved:
+        rows.setdefault(rel, (entry.label, entry.url, entry.extra))
     lines = [BEGIN_MARK, "# 下载链接"]
     for num, rel in enumerate(sorted(rows), 1):
-        label, url = rows[rel]
+        label, url, extra = rows[rel]
         label = label.replace("[", "\\[").replace("]", "\\]")
-        lines.append(f"{num}. [{label}]({url})")
+        line = f"{num}. [{label}]({url})"
+        if extra:
+            line += " " + extra
+        lines.append(line)
     lines.append(END_MARK)
     return "\n".join(lines)
 
@@ -638,6 +714,32 @@ def print_items(items: list[Item]) -> None:
             print(f"         旧 tag：{item.old['tag']}（保留在 GitHub 上，不删）")
 
 
+def print_upload_plan(item: Item, repo: str) -> None:
+    """上传这一步会干什么（dry-run 只打印，不跑 curl）。"""
+    if item.upload_mode == "upload":
+        print(f"  # {item.rel}：release 已存在（{item.tag}），不重建")
+    elif item.upload_mode == "create":
+        print(f"  # {item.rel}：先建一个空 release（--draft，不带资产）再传")
+        print(f"  gh release create {item.tag} --repo {repo} --draft --title <...> --notes <...>")
+    else:
+        print(f"  # {item.rel}：上传前先核对 release 是否已存在（不存在才建空草稿）")
+        print(f"  gh release view {item.tag} --repo {repo}   # 判断 release 是否已存在")
+        print(f"  gh release create {item.tag} --repo {repo} --draft --title <...> --notes <...>"
+              f"   # 不存在时")
+    print(f"  gh release view {item.tag} --repo {repo} --json databaseId,isDraft"
+          f"   # 取 release id")
+    print(f"  curl -T <pdf> --progress-bar -X POST -H 'Content-Type: application/pdf' "
+          f"-K - --fail \\")
+    print(f"       'https://uploads.github.com/repos/{repo}/releases/<id>/assets"
+          f"?name=<远端归一化名>'")
+    print("       # token 由 `gh auth token` 取，只经 stdin（-K -）喂给 curl，不进命令行")
+    if item.upload_mode != "upload" or item.is_draft:
+        print(f"  gh release edit {item.tag} --repo {repo} --draft=false"
+              f"   # 上传完再把草稿发布出去")
+    print(f"  # 回退：没有 curl / 不是交互式终端 / curl 失败 → "
+          f"gh release upload {item.tag} <pdf> --repo {repo} --clobber（没有进度条）")
+
+
 def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.Namespace,
                index_changes: dict[Path, str], ledger_changed: bool) -> None:
     print_items(items)
@@ -653,17 +755,11 @@ def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.N
     print(f"  git -C {root} add -- {' '.join(rels)}")
     print(f"  git -C {root} commit -F <提交信息> -- {' '.join(rels)}")
     print(f"  git -C {root} push origin {args.branch}")
+    if todo:
+        print("  # 上传走 curl -T + --progress-bar（真实进度条）；"
+              "没有 curl / 不是交互式终端 / curl 失败会自动退回 gh（没有进度条）")
     for item in todo:
-        if item.upload_mode == "upload":
-            print(f"  gh release upload {item.tag} <pdf> --repo {args.repo} --clobber")
-        elif item.upload_mode == "create":
-            print(f"  gh release create {item.tag} <pdf> --repo {args.repo}  # release 不存在，直接建")
-        else:
-            print(f"  gh release view {item.tag} --repo {args.repo}   # 判断 release 是否已存在")
-            print(f"  gh release create {item.tag} <pdf> --repo {args.repo}  # 不存在则建")
-            print(f"  #   已存在则改用 gh release upload {item.tag} <pdf> --repo {args.repo} --clobber")
-        if item.is_draft:
-            print(f"  gh release edit {item.tag} --repo {args.repo} --draft=false   # 把草稿发布出去")
+        print_upload_plan(item, args.repo)
 
 
 def build_commit_message(todo: list[Item]) -> str:
@@ -696,6 +792,158 @@ def build_commit_message(todo: list[Item]) -> str:
     lines.append("")
     lines.append("index.md 的「下载链接」块由 books/gbb 自动生成，别手改。")
     return "\n".join(lines) + "\n"
+
+
+def fetch_release_id(repo: str, tag: str) -> tuple[int | None, bool, str]:
+    """取 release 的 databaseId（curl 上传要用）+ isDraft。只读。"""
+    try:
+        proc = run(["gh", "release", "view", tag, "--repo", repo,
+                    "--json", "databaseId,isDraft"])
+    except ToolError as exc:
+        return None, False, str(exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return None, False, detail or f"gh release view 退出码 {proc.returncode}"
+    try:
+        data = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError:
+        return None, False, f"gh release view 输出不是合法 JSON：{proc.stdout.strip()[:200]!r}"
+    if not isinstance(data, dict):
+        return None, False, "gh release view 输出的 JSON 顶层不是对象"
+    release_id = data.get("databaseId")
+    if not isinstance(release_id, int) or isinstance(release_id, bool):
+        return None, False, f"release 没有 databaseId：{release_id!r}"
+    return release_id, bool(data.get("isDraft")), ""
+
+
+def gh_auth_token() -> str:
+    """从 `gh auth token` 取 token。
+
+    ⚠️ 只放内存：不打印、不进 debug 日志、**不进 curl 的 argv**（见 _upload_with_curl）。
+    `gh auth token` 的输出里就是凭据，所以这里故意不走会打日志的 run()。
+    """
+    try:
+        proc = subprocess.run(["gh", "auth", "token"], text=True, capture_output=True)
+    except FileNotFoundError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def progress_bar_status() -> tuple[bool, str]:
+    """能不能用 curl --progress-bar 显示**真实**进度；不能就给出原因（调用方退回 gh）。
+
+    非交互式（stdout 不是终端）时进度条只会变成一堆 `\\r`，宁可不画；
+    标准输入不是终端（`</dev/null` / 管道）也算非交互式，同样不画。
+    """
+    if not sys.stdout.isatty():
+        return False, "当前输出不是交互式终端（sys.stdout.isatty() 为假）"
+    if not sys.stdin.isatty():
+        return False, "标准输入不是终端（</dev/null 或管道）"
+    if shutil.which("curl") is None:
+        return False, "本机没有 curl"
+    return True, ""
+
+
+def _publish_draft_if_needed(args: argparse.Namespace, item: Item,
+                             is_draft: bool) -> tuple[bool, str]:
+    if not is_draft:
+        return True, ""
+    print("  release 是草稿，上传完成后发布：gh release edit --draft=false")
+    edit = run(["gh", "release", "edit", item.tag, "--repo", args.repo,
+                "--draft=false"])
+    if edit.returncode != 0:
+        detail = (edit.stderr or edit.stdout).strip()
+        print(f"  失败：文件传上去了，但草稿没能发布：{detail or '（gh 没输出原因）'}")
+        print("  草稿没有公开，下载链接对别人仍然不可用；没有留半成品，重跑会再补。")
+        return False, f"草稿发布失败：{detail or 'gh 返回非 0'}"
+    print("  草稿已发布，下载链接现在可用了。")
+    return True, ""
+
+
+def _upload_with_gh(args: argparse.Namespace, item: Item, is_draft: bool,
+                    why: str) -> tuple[bool, str]:
+    """没有真实进度时的退路：gh release upload --clobber（明说没有进度条，不编造）。"""
+    print(f"  这次没有进度条：{why}。")
+    print(f"  正在上传 {human_size_mb(item.size)}，{upload_eta_text(item.size)}"
+          f"（按实测约 0.2 MB/s 估算，只是估算、不是真实进度）。")
+    started = time.monotonic()
+    cmd = ["gh", "release", "upload", item.tag, item.pdf, "--repo", args.repo, "--clobber"]
+    try:
+        proc = run(cmd)
+    except ToolError as exc:
+        print(f"  失败：{exc}")
+        return False, str(exc)
+    elapsed = time.monotonic() - started
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        print(f"  失败：{detail or '（gh 没输出原因）'}")
+        return False, detail or "gh 返回非 0"
+    print(f"  上传完成：{human_size_mb(item.size)}，用时 {elapsed_text(elapsed)}"
+          f"（实测 {upload_speed_text(item.size, elapsed)}）")
+    return _publish_draft_if_needed(args, item, is_draft)
+
+
+def _upload_with_curl(args: argparse.Namespace, item: Item, release_id: int) -> tuple[bool, str]:
+    """curl -T + --progress-bar 上传资产（唯一能给出真实进度的做法）。
+
+    ⚠️ token 红线：token 只写进 `-K -` 从 stdin 读的配置里
+    （`header = "Authorization: token <token>"`），**绝不放进 argv** ——
+    进程列表、`ps`、shell 历史、debug 日志里都不该出现它。
+    curl 的进度条画在 stderr 上，所以这里**不捕获 stderr**（让它直接进终端）；
+    stdout 是 GitHub 返回的 JSON，捕获下来但不打印（里面没有 token）。
+    """
+    token = gh_auth_token()
+    if not token:
+        print("  ⚠️ 取不到 gh token（gh auth token 失败或没登录）")
+        return False, "取不到 gh token"
+    asset_name = asset_name_key(item.pdf.name)
+    upload_url = UPLOAD_API_TMPL.format(
+        repo=args.repo, release_id=release_id, name=quote(asset_name, safe=""),
+    )
+    config_text = f'header = "Authorization: token {token}"\n'
+    cmd = [
+        "curl", "-T", str(item.pdf), "--progress-bar", "-X", "POST",
+        "-H", "Content-Type: application/pdf", "-K", "-", "--fail", upload_url,
+    ]
+    print(f"  curl 正在上传 {human_size_mb(item.size)}（真实进度条由 curl 画）…")
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [str(c) for c in cmd],
+            input=config_text,
+            text=True,
+            stdout=subprocess.PIPE,   # GitHub 的 JSON 响应
+            stderr=None,              # 进度条直接进终端，不能吞掉
+        )
+    except FileNotFoundError as exc:
+        print(f"  ⚠️ 调不起 curl：{exc}")
+        return False, "找不到 curl"
+    elapsed = time.monotonic() - started
+    if proc.returncode != 0:
+        print(f"  ⚠️ curl 上传失败（退出码 {proc.returncode}）")
+        return False, f"curl 退出码 {proc.returncode}"
+    print(f"  上传完成：{human_size_mb(item.size)}，用时 {elapsed_text(elapsed)}"
+          f"（实测 {upload_speed_text(item.size, elapsed)}）")
+    return True, ""
+
+
+def _upload_asset(args: argparse.Namespace, item: Item, is_draft: bool) -> tuple[bool, str]:
+    """release 已经存在：把 PDF 传上去，能画真实进度就画，不行/失败就退回 gh。"""
+    release_id, remote_draft, detail = fetch_release_id(args.repo, item.tag)
+    is_draft = is_draft or remote_draft
+    usable, why = progress_bar_status()
+    if release_id is None:
+        print(f"  ⚠️ 取不到 release id（{detail}），没法定 curl 的上传地址")
+        return _upload_with_gh(args, item, is_draft, "取不到 release id")
+    if usable:
+        ok, _ = _upload_with_curl(args, item, release_id)
+        if ok:
+            return _publish_draft_if_needed(args, item, is_draft)
+        print("  ⚠️ 自动退回 gh release upload --clobber（这次没有进度条）")
+        return _upload_with_gh(args, item, is_draft, "curl 上传失败")
+    return _upload_with_gh(args, item, is_draft, why)
 
 
 def do_uploads(args: argparse.Namespace, root: Path, todo: list[Item]) -> list[tuple[Item, str]]:
@@ -733,28 +981,46 @@ def do_uploads(args: argparse.Namespace, root: Path, todo: list[Item]) -> list[t
                           f"{meta.detail or '（gh 没输出原因）'}")
                     mode, is_draft = "create", False
 
+        ok = True
+        reason = ""
         if mode == "upload":
-            print("  release 已存在，改用 gh release upload --clobber（不重建 release）")
-            cmd = ["gh", "release", "upload", item.tag, item.pdf, "--repo", args.repo, "--clobber"]
+            print("  release 已存在，不重建（沿用原来的 tag）")
+            ok, reason = _upload_asset(args, item, is_draft)
         else:
-            cmd = ["gh", "release", "create", item.tag, item.pdf, "--repo", args.repo,
-                   "--title", title, "--notes", notes]
-        proc = run(cmd)
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout).strip()
-            print(f"  失败：{detail or '（gh 没输出原因）'}")
-            failures.append((item, detail or "gh 返回非 0"))
-            break  # 多半是登录/权限/网络问题，后面的不再硬试
-        if is_draft:
-            print("  release 是草稿，上传完成后发布：gh release edit --draft=false")
-            edit = run(["gh", "release", "edit", item.tag, "--repo", args.repo,
-                        "--draft=false"])
-            if edit.returncode != 0:
-                detail = (edit.stderr or edit.stdout).strip()
-                print(f"  失败：文件传上去了，但草稿没能发布：{detail or '（gh 没输出原因）'}")
-                print("  草稿没有公开，下载链接对别人仍然不可用；没有留半成品，重跑会再补。")
-                failures.append((item, f"草稿发布失败：{detail or 'gh 返回非 0'}"))
-                break
+            usable, why = progress_bar_status()
+            if usable:
+                # curl 上传要 release id：先建一个**空草稿**（不带资产），传完再发布，
+                # 免得中途公开一个 0 资产的 release（index.md 已经先推上去了）。
+                print("  先建一个空 release（--draft，不带资产），再用 curl 上传并显示进度")
+                create = run(["gh", "release", "create", item.tag, "--repo", args.repo,
+                              "--title", title, "--notes", notes, "--draft"])
+                if create.returncode != 0:
+                    detail = (create.stderr or create.stdout).strip()
+                    print(f"  失败：{detail or '（gh 没输出原因）'}")
+                    failures.append((item, detail or "gh 返回非 0"))
+                    break  # 多半是登录/权限/网络问题，后面的不再硬试
+                ok, reason = _upload_asset(args, item, True)
+            else:
+                # 没有真实进度可画：沿用一次搞定的 gh release create（带资产），
+                # 只报大小和按实测带宽估的时间，绝不假装有进度。
+                print(f"  这次没有进度条：{why}。")
+                print(f"  正在建 release 并上传 {human_size_mb(item.size)}，"
+                      f"{upload_eta_text(item.size)}"
+                      f"（按实测约 0.2 MB/s 估算，只是估算、不是真实进度）。")
+                started = time.monotonic()
+                create = run(["gh", "release", "create", item.tag, item.pdf, "--repo", args.repo,
+                              "--title", title, "--notes", notes])
+                elapsed = time.monotonic() - started
+                if create.returncode != 0:
+                    detail = (create.stderr or create.stdout).strip()
+                    print(f"  失败：{detail or '（gh 没输出原因）'}")
+                    failures.append((item, detail or "gh 返回非 0"))
+                    break
+                print(f"  上传完成：{human_size_mb(item.size)}，用时 {elapsed_text(elapsed)}"
+                      f"（实测 {upload_speed_text(item.size, elapsed)}）")
+        if not ok:
+            failures.append((item, reason or "上传失败"))
+            break
         print(f"  完成：{item.url}")
     return failures
 
@@ -823,12 +1089,12 @@ def collect_pull_records(root: Path, scan_root: Path, ledger: dict) -> dict[str,
         if not entries:
             continue
         index_dir = index_md.parent
-        for label, url in entries:
+        for entry in entries:
             try:
-                rel = (index_dir / label).resolve().relative_to(root.resolve()).as_posix()
+                rel = (index_dir / entry.label).resolve().relative_to(root.resolve()).as_posix()
             except (OSError, ValueError):
                 continue
-            add(rel, _tag_from_url(url), rel_posix(index_md, root))
+            add(rel, _tag_from_url(entry.url), rel_posix(index_md, root))
     return records
 
 
@@ -1173,17 +1439,17 @@ def _main(args: argparse.Namespace) -> int:
             old_text = index_md.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise ToolError(f"{rel_posix(index_md, root)} 不是 UTF-8 文本：{exc}") from exc
-        preserved: list[tuple[str, str, str]] = []
+        preserved: list[tuple[str, BlockEntry]] = []
         if not is_under(index_dir, scan_root):
             # 这个 index.md 在 cwd 之上：块里可能还有范围外的旧条目，原样保住
             scanned_rels = {it.rel for it in by_index[index_dir]}
-            for label, url in parse_block_items(old_text) or []:
+            for entry in parse_block_items(old_text) or []:
                 try:
-                    rel = (index_dir / label).resolve().relative_to(root.resolve()).as_posix()
+                    rel = (index_dir / entry.label).resolve().relative_to(root.resolve()).as_posix()
                 except (OSError, ValueError):
                     continue
                 if rel not in scanned_rels:
-                    preserved.append((rel, label, url))
+                    preserved.append((rel, entry))
         block = render_block(by_index[index_dir], index_dir, preserved)
         new_text = replace_block(old_text, block, rel_posix(index_md, root))
         if new_text != old_text:

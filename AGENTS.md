@@ -24,6 +24,12 @@ PDF 资料仓。PDF 本体**不进 git**（`.gitignore` 里有 `*.pdf`），由 
   之间的块：已存在就整块替换，不存在就空一行追加到末尾；块外一个字节都不动。
 - 下载链接用 release 页：`https://github.com/<repo>/releases/tag/<tag>`。
 - 列表项用**相对该 index.md 目录的路径**（带 `.pdf`），这样不同目录的同名 PDF 能区分。
+- 托管块每行的格式固定是：
+  ``N. [相对路径](release 链接) · <十进制大小> · sha256:<前 8 位>``
+  （例 `· 52.1 MB · sha256:7986483b`）。大小用**十进制**（和 GitHub release 页显示一致）；
+  完整 sha256 在账本里，块里只放前 8 位，够人肉核对 `sha256sum`。
+  解析时要容忍没有尾巴的旧行；`render_block` 对范围外保留条目（preserved）**原样保留**
+  它原来的大小/hash 文本，不要重新编造。
 - PDF 不进 git：`git -C books ls-files '*.pdf'` 应为空。不要把 PDF `git add` 回去；
   用户磁盘上的 PDF 由脚本扫描，不看 git 索引。
 
@@ -68,6 +74,10 @@ gh release view <tag> --repo <repo> --json tagName,assets,isDraft
 | `isDraft=true`（哪怕资产在） | `[需补传：release 是草稿…]` | `gh release upload --clobber`，**再** `gh release edit <旧 tag> --draft=false` |
 | 核对失败（网络 / 权限 / 输出坏了；非 0 且非 404） | 警告 + `[需补传：远端核对失败，按未上传处理]` | 仍然上传（宁可重传，不留死链） |
 
+> 上表的"上传动作"是**语义**；实际上传默认走 `curl --progress-bar`（见下节），
+> `gh release upload --clobber` 是回退路径。新建时先 `gh release create --draft`（空 release），
+> 传完再 `gh release edit --draft=false`。
+
 - **资产名按 GitHub 的归一化名匹配**：GitHub 会把资产名里 `[A-Za-z0-9._-]` 之外的
   字符换成 `.`。实测本地 `INTEL 80386 PROGRAMMER'S REFERENCE MANUAL 1986.pdf`
   在远端叫 `INTEL.80386.PROGRAMMER.S.REFERENCE.MANUAL.1986.pdf`。
@@ -79,6 +89,56 @@ gh release view <tag> --repo <repo> --json tagName,assets,isDraft
 - 补传**复用账本里的旧 tag**（`index.md` 里的链接就是它）；只有 sha256 变了才生成新 tag。
 - 核对失败**不许静默跳过**。`--no-verify` 是明确"跳过远端核对、只信本地账本"（默认关）；
   账本 `last_remote_state` 不是 `published` 时，`--no-verify` 会提示"上次可能是草稿/未知"。
+
+## 上传：curl 进度条 + 回退 `gh`（2026-11-26）
+
+`gh release create/upload` 是**一次 HTTPS 请求、没有任何进度输出**；100MB 的手册按实测
+0.16–0.23 MB/s 要等十来分钟、全程黑屏。所以资产上传改成 `curl`（只有它能给真实进度）：
+
+1. **先建空 release**（不带资产）拿 id：
+   - 新建时：`gh release create <tag> --repo <repo> --draft --title … --notes …`
+     （**用 `--draft`**：`index.md` 在传之前就已经推上去了，先公开一个 0 资产的 release
+     等于留死链；传完再发）；
+   - 补传时 release 已存在，直接取 id；
+   - 取 id：`gh release view <tag> --repo <repo> --json databaseId,isDraft` → `.databaseId`。
+2. **curl 上传**：
+
+   ```sh
+   curl -T <pdf> --progress-bar -X POST \
+        -H 'Content-Type: application/pdf' -K - --fail \
+        'https://uploads.github.com/repos/<owner>/<repo>/releases/<id>/assets?name=<远端归一化名>'
+   ```
+
+   - 目标域名是 **uploads.github.com**，不是 api.github.com；`?name=` 用
+     `asset_name_key()` 归一化后的名字（GitHub 会把空格/引号换成 `.`）。
+   - **token 红线**：token 由 `gh auth token` 读出，只写成 curl 配置文件
+     `header = "Authorization: token <token>"`，通过 **`-K -` 从 stdin** 喂进去。
+     **绝不许进 curl 的 argv**（`ps` / shell 历史 / 日志都会漏）；
+     `gh_auth_token()` 故意不走会打 debug 日志的 `run()`，也不要打印它的输出。
+   - `--fail` 必须有：不加的话 HTTP 4xx/5xx 时 curl 退出码仍是 0，会被误判成成功。
+   - 进度条画在 **stderr**，所以调用 curl 时 **stderr 不能 capture**（否则进度条被吞掉）。
+3. **传完**：打印实测 `MB/s` + 耗时；是草稿就
+   `gh release edit <tag> --repo <repo> --draft=false`。
+4. **回退**（自动，不询问）：`curl` 不存在 / 非交互式（`sys.stdout.isatty()` 假，
+   或 stdin 不是终端，如 `</dev/null`）/ `curl` 失败 → 改用
+   `gh release upload <tag> <pdf> --repo <repo> --clobber`，并**明说"这次没有进度条"**。
+   - 非 TTY 分支**不编造进度**：只打印 `正在上传 <大小>，约需 N 分钟`
+     （按实测 0.2 MB/s 估算，并注明是估算），然后等 `gh` 返回。
+   - 新建 + 非 TTY 时仍用一次 `gh release create <tag> <pdf> …` 完成（不先建空 release）。
+
+## 旧版怎么找回（hash 变了 = 新 tag，旧 release 不删）
+
+sha256 变了 → `make_tag()` 生成新 tag、新 release；旧 tag 留在账本的 `previous[]` 里，
+GitHub 上的旧 release **不删**。`index.md` 进 git，所以旧版本的发布记录能从历史里翻：
+
+```sh
+git log -p -- <某个 index.md>          # 哪次提交改了哪一行（旧 tag / 旧 sha256）
+git show <旧提交>:<某个 index.md>      # 整份旧 index.md，复制旧 tag
+# 打开 https://github.com/allinkernel/wblog-books/releases/tag/<旧 tag> 下载旧 PDF
+```
+
+`index.md` 的托管块是**整块替换**，块外不动；**不要**在块外另加"版本历史"段落 ——
+回溯靠 git 历史，正文不要掺版本记录。
 
 ## `--pull`（下载本地缺失的 PDF）
 
@@ -128,6 +188,8 @@ git -C books status --short
 1. 建 `/tmp/books-fixture/`，把 `gbb` 和 `tools/` 拷进去（脚本根 = `tools/` 的父目录），
    `git init -b main` 并配一个本地 bare `origin`；
 2. 发布流程：`a/b/c/x.pdf` 归 `a/index.md`；同一个 PDF 改一个字节 → 新 tag 且旧条目还在；
+   `index.md` 新行带 `· <十进制大小> · sha256:<新 sha 前 8 位>`（与 `sha256sum` 一致），
+   旧 tag 进账本 `previous`、旧 release 仍在（桩不删）；
    连跑两次 → 第二次全部跳过（假 `gh` 要记住第一次 `create` 的 release / 资产，
    这样第二次 `gh release view` 能核对通过；只验账本那半也可以加 `--no-verify`）；
    `a/x.pdf` 但往上没有 `index.md` → 报错并列出；
@@ -157,3 +219,13 @@ git -C books status --short
    - `--no-verify` → 桩调用日志里**没有** `release view`（新文件也只 `create`）；
    - `--pull`：账本说上传过、本地缺失、远端也没有 → `[远端也没有] … 不能 pull`；
      核对失败 → 警告但仍下载；下载后落盘名与本地文件名一致。
+6. **上传进度（夹具，桩 `curl` 把 argv + 收到的 stdin 都记日志）**：
+   - 交互式终端（用 `script -qec` 造 pty）→ `curl` 被调用，argv 里有 `-T <pdf>`、
+     `--progress-bar`、`uploads.github.com/.../assets?name=<归一化名>`；
+     **argv 里没有 `gho_` / `token=`**，而 stdin（`-K -` 的配置）里有
+     `Authorization: token …`；输出有 `MB/s`；草稿走完后有 `release edit --draft=false`。
+   - `curl` 退出非 0 → 日志里出现 `gh release upload <tag> <pdf> --clobber`（自动回退）。
+   - 非 TTY（stdout 重定向 + `</dev/null`）→ 日志里**没有** curl，输出没有进度条，
+     但有 `约需 N 分钟`/`约需 N 秒`，并注明是估算。
+   - PATH 里去掉 curl（但保留 python3/git/gh）→ 回退 gh，理由打印"本机没有 curl"。
+   - `--dry-run` 只打印 curl 计划（`-T <pdf> --progress-bar … assets?name=`），**不调** curl。

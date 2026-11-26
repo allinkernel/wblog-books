@@ -1,7 +1,7 @@
 # books
 
 放 PDF 资料的地方：**PDF 不进 git**，由 GitHub Release 托管；每个 PDF 一个 release，
-下载链接由 `books/gbb` 自动写进最近的 `index.md`。
+下载链接（带大小和 sha256 前 8 位）由 `books/gbb` 自动写进最近的 `index.md`。
 
 ## 用法
 
@@ -90,6 +90,63 @@ GitHub 会把资产名里的空格、引号换成 `.`；gbb 会自动用远端�
 成功 2 / 跳过 1 / 失败 0
 ```
 
+### 上传时能看到进度吗
+
+能。上传资产时 `gbb` 走 `curl -T … --progress-bar`，在终端里会画一条**真实进度条**：
+
+```
+[1/1] cpu-体系结构-官方手册/intel体系结构官方手册/8086/INTEL-The_8086_family_user's_manual.pdf
+  先建一个空 release（--draft，不带资产），再用 curl 上传并显示进度
+  curl 正在上传 52.1 MB（真实进度条由 curl 画）…
+  ######################################## 100.0%
+  上传完成：52.1 MB，用时 4 分 12 秒（实测 0.21 MB/s）
+  release 是草稿，上传完成后发布：gh release edit --draft=false
+  草稿已发布，下载链接现在可用了。
+```
+
+上传完会打印**实测速度**（MB/s）和耗时，就不用猜到底多慢了。
+
+**这些情况没有进度条**（会自动退回 `gh`，只报大小和估算时间，不会假装有进度）：
+
+- 本机没有 `curl`；
+- 输出不是交互式终端（重定向到文件、管道、`</dev/null` 等）；
+- `curl` 上传失败（会再自动用 `gh release upload --clobber` 试一次）。
+
+这时打印的是：
+
+```
+  这次没有进度条：当前输出不是交互式终端（sys.stdout.isatty() 为假）。
+  正在上传 52.1 MB，约需 4 分钟（按实测约 0.2 MB/s 估算，只是估算、不是真实进度）。
+```
+
+### 下载链接里的大小和 sha256
+
+每个 `index.md` 的下载块里，每行都带**大小**和 **sha256 前 8 位**：
+
+```markdown
+1. [INTEL-The_8086_family_user's_manual.pdf](https://github.com/allinkernel/wblog-books/releases/tag/8086__...__20261126-1214) · 52.1 MB · sha256:7986483b
+```
+
+完整 sha256 在 `.books-releases.json` 里。PDF 被改过（sha256 变了）→ 会用**新 tag** 发**新 release**，
+旧 release **不删**、旧 tag 留在账本的 `previous` 里。
+
+### 想下载旧版本的 PDF
+
+`index.md` 是进 git 的，所以旧版本记录可以从 git 历史里翻出来：
+
+```sh
+# 1. 看某个 index.md 改过哪些次（提交、时间、diff）
+git log -p -- cpu-体系结构-官方手册/intel体系结构官方手册/8086/index.md
+
+# 2. 把某一个旧提交里的 index.md 完整打出来（找到那一行的旧 tag）
+git show <旧提交>:cpu-体系结构-官方手册/intel体系结构官方手册/8086/index.md
+
+# 3. 用旧 tag 打开 release 页，下载的就是旧版 PDF
+#    https://github.com/allinkernel/wblog-books/releases/tag/<旧 tag>
+```
+
+（`git log --oneline -- <index.md>` 先列提交号，再 `git show <提交号>:<index.md>`。）
+
 ## 首次准备（只需要一次）
 
 ```sh
@@ -117,8 +174,11 @@ git -C books push -u origin main
 - **tag 规则**：`<index.md 所在目录名>__<PDF 文件名去扩展>__<YYYYMMDD-HHMM>`；
   只保留字母、数字、`._-`（中文保留），空格 / 引号 / 斜杠 / 冒号换成 `-`，最长 100；
   同一分钟内重名自动加 `-2`、`-3`。
-- **改了 PDF 会整仓重传吗**：不会。sha256 变了才用新 tag 重传；没变也会先核对远端，
-  远端缺文件、大小不对或还是草稿才补传（沿用原来的 tag）。
+- **改了 PDF 会整仓重传吗**：不会。sha256 变了才会用**新 tag** 重传（旧 release 留在 GitHub 上，
+  旧 tag 记在账本 `previous` 里）；没变也会先核对远端，远端缺文件、大小不对或还是草稿才补传
+  （沿用原来的 tag）。index.md 里每行的 sha256 前 8 位可以直接拿来核对。
+- **想看上传进度**：在终端里跑就有真实进度条（`curl --progress-bar`）；重定向 / 没有 `curl` /
+  `curl` 失败时没有进度条，会打印大小和按实测带宽估算的时间，不会编造进度。
 - **上传失败或选择暂不上传**：脚本会把这次对 `index.md` 和 `.books-releases.json`
   的改动回滚并推送，修好后重跑 `./gbb` 即可，不会留下指向空 release 的链接。
 - **上传被 Ctrl-C 打断了怎么办**：直接重跑 `./gbb`。它会发现远端 release 是空的 / 还是草稿，
