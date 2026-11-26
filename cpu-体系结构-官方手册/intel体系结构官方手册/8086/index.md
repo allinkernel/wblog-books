@@ -27,5 +27,5 @@
 
 <!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
 # 下载链接
-1. [INTEL-The_8086_family_user's_manual.pdf](https://github.com/allinkernel/wblog-books/releases/tag/8086__INTEL-The_8086_family_user-s_manual__20261126-1214)
+1. [INTEL-The_8086_family_user's_manual.pdf](https://github.com/allinkernel/wblog-books/releases/tag/8086__INTEL-The_8086_family_user-s_manual__20261126-1214) · 52.1 MB · sha256:7986483b
 <!-- books:downloads:end -->

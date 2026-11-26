@@ -49,5 +49,5 @@
 
 <!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
 # 下载链接
-1. [325462-087-sdm-vol-1-2abcd-3abcd-4.pdf](https://github.com/allinkernel/wblog-books/releases/tag/amd64-intel64__325462-087-sdm-vol-1-2abcd-3abcd-4__20261126-1411)
+1. [325462-087-sdm-vol-1-2abcd-3abcd-4.pdf](https://github.com/allinkernel/wblog-books/releases/tag/amd64-intel64__325462-087-sdm-vol-1-2abcd-3abcd-4__20261126-1411) · 25.9 MB · sha256:2d1534c7
 <!-- books:downloads:end -->
