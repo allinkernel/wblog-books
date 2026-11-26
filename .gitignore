@@ -1,0 +1,5 @@
+# PDF 不进 git：由 GitHub Release 托管，下载链接由 books/gbb 写进最近的 index.md。
+*.pdf
+
+# Python 运行产生的缓存
+__pycache__/

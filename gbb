@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# books/gbb —— 把 books/ 下的 PDF 发到 GitHub Release，并把下载链接写回 index.md。
+# 实现见 tools/books_gbb.py；用法见 README.md。
+exec python3 "$(cd "$(dirname "$0")" && pwd)/tools/books_gbb.py" "$@"
