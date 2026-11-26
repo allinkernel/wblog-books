@@ -24,3 +24,8 @@
 5. **中断和异常处理：** 详细说明中断类型（硬件、软件）、中断向量表（IVT）的结构和位置、中断处理流程、可屏蔽中断（INTR）和非屏蔽中断（NMI）。
 6. **配套芯片资料：** 手册通常包含8087数值协处理器、8089 I/O处理器以及828x系列支持芯片的简要或详细说明（有时这些芯片会有单独的详细手册）。
 7. **附录：** 可能包含指令集按操作码排序的速查表、指令执行时间汇总表、指令按功能分类的索引等实用信息。
+
+<!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
+# 下载链接
+1. [INTEL-The_8086_family_user's_manual.pdf](https://github.com/allinkernel/wblog-books/releases/tag/8086__INTEL-The_8086_family_user-s_manual__20261126-1212)
+<!-- books:downloads:end -->
