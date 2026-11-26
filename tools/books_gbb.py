@@ -1,27 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""books/gbb 的实现：把 PDF 发到 GitHub Release，并把下载链接写回 index.md。
+"""books/gbb 的实现：把 PDF 压成 tar.xz（过大再分卷）发到 GitHub Release，
+并把下载链接写回最近的 index.md。
 
-只用标准库 + 本机的 git / gh 命令。
+只用标准库 + 本机的 tar / xz / split / git / gh / curl 命令。
 
 核心约定（细节见 ../AGENTS.md）：
   * 扫描范围 = **当前工作目录及其子目录**（--all 才扫整个仓库）；
   * PDF 归属"从它所在目录往上找、最近的那个含 index.md 的目录"（可以找到 cwd 之上，
     但扫描不会把 cwd 之外的 PDF 拉进来）；
-  * 一个 PDF 一个 tag：<目录名>__<文件名去扩展>__<YYYYMMDD-HHMM>；
+  * 一个 PDF / 一本书一个 tag：<目录名>__<文件名去扩展>__<YYYYMMDD-HHMM>；
+  * **更新判据 = sha256 + 文件 mtime，两个条件任一变化都要更新**：
+      - sha256 变  -> 新 tag、新 release（旧 release 不删）
+      - mtime 变   -> 同样新 tag、新 release（`git checkout` 老 PDF 会改 mtime，
+                      所以会故意重传一次；这是明确的取舍，README 里写着）
+  * 上传的不是裸 PDF，而是 `tar -C <目录> -cJf` 出来的 `<pdf>.tar.xz`
+    （xz 用 `-6 -T0` 多线程，保留原名，解压后文件名不变）；产物 > 10 MiB 就
+    `split -b 10M -d -a 2` 成 `.part.00 .part.01 …`，每个分卷单独是一个资产；
+  * 临时目录 = PDF 同目录下的隐藏目录 `.<pdf>.gbb_tar_dir`
+    （放 .tar.xz、分卷和 `.gbb-archive.json`）。上传成功清理，`--keep-temp` 保留；
+    失败保留，下次运行校验 manifest 后复用已有分卷、不重复压缩；
+  * 分卷并发上传（`--jobs`，默认 4）：并发时**不画单文件进度条**，每 2 秒刷一行
+    "已完成 x/N 个分卷 · 已传 … / … · …/s"（非 TTY 每 10 秒一行）；
+    `--jobs 1` 且是终端时用 curl 的单文件真实进度条。进度只来自"已完成分卷"，
+    绝不编造；
   * 账本 ../.books-releases.json 记
-    {PDF 相对路径: {sha256, tag, url, size, asset_size, last_remote_state, uploaded_at}}；
-  * **账本只是"上次以为成功"的线索，远端才是事实**：sha256 没变也要先
-    `gh release view` 核对 release / 资产 / 大小（草稿也算没传好），对不上就补传；
+    {PDF 相对路径: {sha256, mtime, tag, url, size, asset_size, last_remote_state,
+                   uploaded_at, archive:{name,size,parts:[{name,size}]}}}；
+  * **账本只是"上次以为成功"的线索，远端才是事实**：sha256 与 mtime 都没变也要先
+    `gh release view` 核对 release / 分卷 / 大小（草稿也算没传好），对不上就补传；
     默认核对，`--no-verify` 才只信账本；
   * 只把托管块（books:downloads:begin … end）写进 index.md，块外一个字不动；
-    块里每行带「大小 + sha256 前 8 位」（完整 hash 在账本里），改 PDF → 新 tag；
-    旧 release 不删，要找回旧版就 `git show <旧提交>:index.md` 拿旧 tag；
-  * 上传资产优先用 `curl -T … --progress-bar`（真实进度条，token 只走 stdin），
-    没有 curl / 不是交互式终端 / curl 失败 → 自动退回
-    `gh release upload --clobber`（并说明这次没有进度条，不编造进度）；
-  * --pull：按账本 + index.md 托管块，把当前目录范围内本地缺失的 PDF 下载回来，
-    不改 index.md、不提交、不推送。
+    块里每行带「大小 + sha256 前 8 位 + mtime」（完整 hash 在账本里）；
+  * 写 index.md + 账本 -> commit -> push -> 再上传（推送前链接就已经就位）；
+  * --pull：**以 index.md 托管块为准**（tag / 大小 / sha256 前 8 位 / mtime），
+    账本补全 sha256；`gh release view` 列出全部分卷 -> 并发下载到
+    `.<pdf>.gbb_tar_dir` -> 校验分卷齐全 -> cat 拼接 -> tar -xJf -> 校验 sha256
+    -> 落到原路径 -> 清理临时目录。旧形态（release 里只有一个 .pdf 资产）直接下载。
 """
 
 from __future__ import annotations
@@ -37,7 +52,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -49,18 +66,26 @@ LEDGER_NAME = ".books-releases.json"
 DEFAULT_REPO = "allinkernel/wblog-books"
 DEFAULT_BRANCH = "main"
 MAX_TAG_LEN = 100
-MAX_RELEASE_BYTES = 2 * 1024 ** 3  # GitHub Release 单文件 2GB 上限
 URL_TMPL = "https://github.com/{repo}/releases/tag/{tag}"
 # 上传资产走 GitHub 的 uploads 域名（不是 api.github.com）；release id 先建空 release 拿到。
 UPLOAD_API_TMPL = "https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}"
-# 实测上传带宽 ≈0.16–0.23 MB/s（下载 2.6–4.8 MB/s）。只用于"大约还要多久"的**估算**，
-# 绝不拿它编造真实进度：拿不到 curl 的真实进度条时就明说没有进度条。
-UPLOAD_EST_BYTES_PER_SEC = 0.2 * 1000 * 1000
+# 分卷：单个分卷上限 10 MiB（split -b 10M = 10*1024*1024），超过就切。
+PART_BYTES = 10 * 1024 * 1024
+SPLIT_SIZE_ARG = "10M"
+# xz 用多线程（-T0 = 所有核）；-9 太慢，-6 是默认档，压缩率已经够。
+XZ_PROGRAM = "xz -6 -T0"
+ARCHIVE_SUFFIX = ".tar.xz"
+TEMP_DIR_SUFFIX = ".gbb_tar_dir"
+MANIFEST_NAME = ".gbb-archive.json"
+CONTENT_TYPE = "application/octet-stream"
+DEFAULT_JOBS = 4
 # `gh release view` 对"release 不存在"的说法：stderr 一行 `release not found`，
 # 或者 HTTP 404。别把网络 / 权限错误也当成"没有 release"，那是两回事。
 NOT_FOUND_RE = re.compile(r"(?:\b404\b|not found)", re.IGNORECASE)
+PART_SUFFIX_RE = re.compile(r"\.part\.(\d+)$")
 
 DEBUG = False
+PRINT_LOCK = threading.Lock()
 
 
 class ToolError(Exception):
@@ -74,15 +99,18 @@ class Item:
     index_dir: Path
     index_rel: str    # 相对 books/ 的 index.md 路径
     sha: str
+    mtime: str        # ISO8601 到秒
+    mtime_text: str   # 展示成 `2026-11-26 21:40`
     size: int
     tag: str
     url: str
     kind: str         # new / changed / reupload / skip
-    reason: str = ""          # reupload 的人话原因（进计划、提交信息）
+    reason: str = ""          # changed / reupload 的人话原因（进计划、提交信息）
     old: dict | None = None
     is_draft: bool = False
     upload_mode: str = "unknown"   # create / upload / unknown（规划阶段已知的补传路径）
     verify_label: str = ""         # skip 时：空 = 真跳过；--no-verify = 没核对
+    archive_info: "ArchiveInfo | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +158,7 @@ def human_size(num: int) -> str:
 
 
 def human_size_mb(num: int) -> str:
-    """十进制大小，和 GitHub release 页 / 下载器显示的口径一致（52.1 MB）。
-
-    index.md 托管块里用这个（用户看到的就是 release 页上的那个数）；
-    计划 / 日志里仍用 human_size() 的 MiB，别把两套口径混着改。
-    """
+    """十进制大小，和 GitHub release 页 / 下载器显示的口径一致（52.1 MB）。"""
     value = float(num)
     if value < 1000:
         return f"{int(value)} B"
@@ -143,6 +167,14 @@ def human_size_mb(num: int) -> str:
     if value < 1000 ** 3:
         return f"{value / 1000 ** 2:.1f} MB"
     return f"{value / 1000 ** 3:.2f} GB"
+
+
+def human_rate(bytes_per_sec: float) -> str:
+    if bytes_per_sec < 1000:
+        return f"{bytes_per_sec:.0f} B/s"
+    if bytes_per_sec < 1000 ** 2:
+        return f"{bytes_per_sec / 1000:.1f} KB/s"
+    return f"{bytes_per_sec / 1000 ** 2:.1f} MB/s"
 
 
 def elapsed_text(seconds: float) -> str:
@@ -162,22 +194,18 @@ def upload_speed_text(size: int, seconds: float) -> str:
     return f"{size / 1e6 / seconds:.2f} MB/s"
 
 
-def upload_eta_text(size: int) -> str:
-    """按实测 0.2 MB/s 估一个"大约多久"，只是给等的人一个心理预期。"""
-    seconds = size / UPLOAD_EST_BYTES_PER_SEC
-    if seconds < 90:
-        return f"约需 {seconds:.0f} 秒"
-    if seconds < 3600:
-        return f"约需 {seconds / 60:.0f} 分钟"
-    return f"约需 {seconds / 3600:.1f} 小时"
-
-
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def mtime_info(path: Path) -> tuple[str, str]:
+    """(ISO8601 到秒, 展示成 `YYYY-MM-DD HH:MM`)；都用本地时区。"""
+    dt = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+    return dt.isoformat(timespec="seconds"), dt.strftime("%Y-%m-%d %H:%M")
 
 
 def url_for(repo: str, tag: str) -> str:
@@ -221,7 +249,11 @@ def resolve_repo_root(start: Path) -> Path:
 def scan_pdfs(root: Path) -> list[Path]:
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d != ".git")
+        # `.ABC.pdf.gbb_tar_dir` 是压缩/下载的临时目录，里面的 PDF 不算书。
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d != ".git" and not d.endswith(TEMP_DIR_SUFFIX)
+        )
         base = Path(dirpath)
         for name in sorted(filenames):
             if name.lower().endswith(".pdf"):
@@ -293,6 +325,188 @@ def used_tags(root: Path, ledger: dict) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# 压缩 / 分卷（临时目录 .<pdf>.gbb_tar_dir）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ArchivePart:
+    path: Path
+    name: str
+    size: int
+
+
+@dataclass
+class ArchiveInfo:
+    tmp_dir: Path
+    archive: Path
+    archive_name: str
+    parts: list[ArchivePart]
+    reused: bool = False
+
+    @property
+    def total_size(self) -> int:
+        return sum(part.size for part in self.parts)
+
+    def as_ledger(self) -> dict:
+        return {
+            "name": self.archive_name,
+            "size": self.archive.stat().st_size,
+            "parts": [{"name": part.name, "size": part.size} for part in self.parts],
+        }
+
+
+def tmp_dir_for(pdf: Path) -> Path:
+    return pdf.parent / f".{pdf.name}{TEMP_DIR_SUFFIX}"
+
+
+def archive_name_for(pdf: Path) -> str:
+    return pdf.name + ARCHIVE_SUFFIX
+
+
+def load_archive_manifest(tmp: Path, pdf: Path, sha: str, mtime: str) -> ArchiveInfo | None:
+    """读 `.gbb-archive.json`；只有 sha256 与 mtime 都对上、文件也齐才允许复用。
+
+    复用分卷的前提是"还是同一个版本的 PDF"：mtime 或 sha256 任一不同就重压，
+    免得把上一次的旧压缩包当成这次的内容传上去。
+    """
+    path = tmp / MANIFEST_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("pdf") != pdf.name or data.get("sha256") != sha or data.get("mtime") != mtime:
+        return None
+    archive_meta = data.get("archive")
+    if not isinstance(archive_meta, dict):
+        return None
+    archive_name = archive_meta.get("name")
+    if not isinstance(archive_name, str) or Path(archive_name).name != archive_name:
+        return None
+    archive = tmp / archive_name
+    if not archive.is_file():
+        return None
+    archive_size = archive_meta.get("size")
+    if not isinstance(archive_size, int) or isinstance(archive_size, bool):
+        return None
+    if archive.stat().st_size != archive_size:
+        return None
+    parts: list[ArchivePart] = []
+    raw_parts = data.get("parts")
+    if not isinstance(raw_parts, list) or not raw_parts:
+        return None
+    for raw in raw_parts:
+        if not isinstance(raw, dict):
+            return None
+        name = raw.get("name")
+        size = raw.get("size")
+        if not isinstance(name, str) or Path(name).name != name:
+            return None
+        if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+            return None
+        part_path = tmp / name
+        if not part_path.is_file() or part_path.stat().st_size != size:
+            return None
+        parts.append(ArchivePart(part_path, name, size))
+    return ArchiveInfo(tmp, archive, archive_name, parts, reused=True)
+
+
+def write_archive_manifest(info: ArchiveInfo, pdf: Path, sha: str, mtime: str) -> None:
+    data = {
+        "version": 1,
+        "pdf": pdf.name,
+        "sha256": sha,
+        "mtime": mtime,
+        "archive": {"name": info.archive_name, "size": info.archive.stat().st_size},
+        "parts": [{"name": part.name, "size": part.size} for part in info.parts],
+    }
+    (info.tmp_dir / MANIFEST_NAME).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def prepare_archive(pdf: Path, sha: str, mtime: str) -> ArchiveInfo:
+    """把 PDF 压成 <pdf>.tar.xz（xz -6 -T0），超过 10 MiB 再分卷；能复用就复用。"""
+    tmp = tmp_dir_for(pdf)
+    reused = load_archive_manifest(tmp, pdf, sha, mtime)
+    if reused is not None:
+        names = " / ".join(part.name for part in reused.parts[:3])
+        more = "" if len(reused.parts) <= 3 else f" …（共 {len(reused.parts)} 个）"
+        print(f"  复用上次留下的分卷（sha256 与 mtime 都没变，不重新压缩）：{names}{more}")
+        return reused
+
+    if tmp.exists():
+        if not (tmp.is_dir() and tmp.name.endswith(TEMP_DIR_SUFFIX)):
+            raise ToolError(f"临时路径 {tmp} 不是 gbb 的临时目录，不敢删")
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    archive_name = archive_name_for(pdf)
+    archive = tmp / archive_name
+
+    print(f"  压缩：{pdf.name} → .{pdf.name}{TEMP_DIR_SUFFIX}/{archive_name}")
+    started = time.monotonic()
+    tar_cmd = [
+        "tar", "-C", str(pdf.parent),
+        f"--use-compress-program={XZ_PROGRAM}",
+        "-cf", str(archive), "--", pdf.name,
+    ]
+    proc = run(tar_cmd)
+    if proc.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        detail = (proc.stderr or proc.stdout).strip()
+        raise ToolError(
+            f"tar / xz 压缩失败（{XZ_PROGRAM}）：\n{detail or '（没有输出）'}\n"
+            "  确认本机有 tar 与 xz（xz 要支持 -T0 多线程）。"
+        )
+    archive_size = archive.stat().st_size
+    print(f"  压缩完成：{human_size_mb(archive_size)}，用时 {elapsed_text(time.monotonic() - started)}")
+
+    part_paths: list[Path] = [archive]
+    if archive_size > PART_BYTES:
+        split_cmd = [
+            "split", "-b", SPLIT_SIZE_ARG, "-d", "-a", "2",
+            str(archive), str(archive) + ".part.",
+        ]
+        proc = run(split_cmd)
+        if proc.returncode != 0:
+            shutil.rmtree(tmp, ignore_errors=True)
+            detail = (proc.stderr or proc.stdout).strip()
+            raise ToolError(f"split 分卷失败：\n{detail or '（没有输出）'}")
+        part_paths = sorted(
+            (p for p in tmp.iterdir() if p.is_file() and p.name.startswith(archive_name + ".part.")),
+            key=lambda p: p.name,
+        )
+        if len(part_paths) < 2:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ToolError("产物超过 10 MiB，但 split 之后没有拿到多个分卷")
+        print(f"  分卷：{len(part_paths)} 个（每个 ≤ 10 MiB）")
+
+    parts = [ArchivePart(path, path.name, path.stat().st_size) for path in part_paths]
+    for part in parts:
+        if part.size > PART_BYTES:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ToolError(f"分卷 {part.name} 有 {human_size_mb(part.size)}，超过 10 MiB 上限")
+    info = ArchiveInfo(tmp, archive, archive_name, parts)
+    write_archive_manifest(info, pdf, sha, mtime)
+    total = human_size_mb(info.total_size)
+    print(f"  待上传 {len(parts)} 个资产，共 {total}")
+    return info
+
+
+def cleanup_temp(info: ArchiveInfo, keep: bool) -> None:
+    if keep:
+        print(f"  保留临时目录：{info.tmp_dir}")
+        return
+    if info.tmp_dir.is_dir() and info.tmp_dir.name.endswith(TEMP_DIR_SUFFIX):
+        shutil.rmtree(info.tmp_dir, ignore_errors=True)
+        print(f"  已清理临时目录：{info.tmp_dir.name}")
+
+
+# ---------------------------------------------------------------------------
 # 远端核对（gh release view）—— 账本只当线索，远端才是事实
 # ---------------------------------------------------------------------------
 
@@ -305,14 +519,22 @@ class RemoteRelease:
 
 
 @dataclass
+class BookAssets:
+    """一个 release 里属于这本书的资产形态。"""
+
+    form: str                   # parts / single / pdf / none
+    parts: list = field(default_factory=list)        # parts 形态：按 .part.NN 排好序
+    part_indexes: list[int] = field(default_factory=list)
+    single: dict | None = None                       # single 形态：一个 <pdf>.tar.xz
+    pdf: dict | None = None                          # 旧形态：一个裸 .pdf
+
+
+@dataclass
 class RemoteCheck:
-    state: str                 # ok / no-release / no-asset / size-mismatch / draft / error
+    state: str                 # ok / no-release / no-asset / form-changed / incomplete / draft / error
     detail: str = ""
-    exists: bool = False
+    form: str = ""
     is_draft: bool = False
-    has_asset: bool = False
-    asset_name: str = ""
-    asset_size: int | None = None
 
 
 def asset_name_key(name: str) -> str:
@@ -323,20 +545,6 @@ def asset_name_key(name: str) -> str:
     所以"按文件名匹配"要先做同样的归一化。
     """
     return "".join(ch if (ch.isalnum() or ch in ".-_") else "." for ch in name)
-
-
-def find_asset(assets: list, filename: str) -> dict | None:
-    """在 assets[] 里按文件名找资产：先精确匹配，再按 GitHub 的归一化名匹配。"""
-    for asset in assets:
-        if isinstance(asset, dict) and asset.get("name") == filename:
-            return asset
-    target = asset_name_key(filename)
-    for asset in assets:
-        if not isinstance(asset, dict):
-            continue
-        if asset_name_key(str(asset.get("name") or "")) == target:
-            return asset
-    return None
 
 
 def fetch_remote_release(repo: str, tag: str) -> RemoteRelease:
@@ -370,52 +578,115 @@ def fetch_remote_release(repo: str, tag: str) -> RemoteRelease:
     return RemoteRelease("ok", "", bool(data.get("isDraft")), assets)
 
 
-def check_remote_asset(repo: str, tag: str, filename: str,
-                       local_size: int | None = None) -> RemoteCheck:
-    """核对远端 release 里有没有这个文件、大小对不对。
+def classify_book_assets(assets: list, pdf_name: str) -> BookAssets:
+    """把 release 的资产分成：分卷 / 单个 tar.xz / 旧版裸 pdf / 什么都没有。"""
+    key = asset_name_key(pdf_name)
+    tar_key = key + ARCHIVE_SUFFIX
 
-    local_size=None 表示本地没有这个文件（--pull 用），此时只核对存在性。
-    草稿一律返回 draft（草稿的下载链接对别人不可用，不能算"已传好"）。
-    """
+    numbered: list[tuple[int, dict]] = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = asset_name_key(str(asset.get("name") or ""))
+        if not name.startswith(tar_key + ".part."):
+            continue
+        match = PART_SUFFIX_RE.search(name)
+        numbered.append((int(match.group(1)) if match else -1, asset))
+    if numbered:
+        numbered.sort(key=lambda pair: pair[0])
+        return BookAssets(
+            "parts",
+            parts=[asset for _idx, asset in numbered],
+            part_indexes=[idx for idx, _asset in numbered],
+        )
+
+    for asset in assets:
+        if isinstance(asset, dict) and asset_name_key(str(asset.get("name") or "")) == tar_key:
+            return BookAssets("single", single=asset)
+    for asset in assets:
+        if isinstance(asset, dict) and asset_name_key(str(asset.get("name") or "")) == key:
+            return BookAssets("pdf", pdf=asset)
+    return BookAssets("none")
+
+
+def _asset_size(asset: dict) -> int | None:
+    try:
+        value = int(asset.get("size"))
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
+def _expected_remote_items(book: BookAssets) -> list[dict]:
+    if book.form == "parts":
+        return list(book.parts)
+    if book.form == "single" and book.single:
+        return [book.single]
+    if book.form == "pdf" and book.pdf:
+        return [book.pdf]
+    return []
+
+
+def check_remote_book(repo: str, tag: str, pdf_name: str, old: dict | None) -> RemoteCheck:
+    """核对账本里这本书在远端是否完好：release 在、不是草稿、分卷形态和大小对得上。"""
     meta = fetch_remote_release(repo, tag)
     if meta.state == "error":
         return RemoteCheck("error", meta.detail)
     if meta.state == "no-release":
         return RemoteCheck("no-release", meta.detail)
-    asset = find_asset(meta.assets, filename)
-    if asset is None:
-        detail = ("release 是草稿且没有资产" if meta.is_draft
-                  else f"release 里没有 {filename!r}")
-        return RemoteCheck("draft" if meta.is_draft else "no-asset", detail,
-                           exists=True, is_draft=meta.is_draft)
-    remote_name = str(asset.get("name") or filename)
-    try:
-        remote_size = int(asset.get("size"))
-    except (TypeError, ValueError):
-        return RemoteCheck(
-            "error",
-            f"远端资产 {remote_name!r} 的 size 不是整数：{asset.get('size')!r}",
-            exists=True, is_draft=meta.is_draft, has_asset=True, asset_name=remote_name,
-        )
+    book = classify_book_assets(meta.assets, pdf_name)
     if meta.is_draft:
-        if local_size is not None and remote_size != local_size:
-            detail = (f"release 是草稿（资产大小也不一致：本地 {human_size(local_size)}，"
-                      f"远端 {human_size(remote_size)}）")
-        else:
-            detail = "release 是草稿（未发布）"
-        return RemoteCheck("draft", detail, exists=True, is_draft=True, has_asset=True,
-                           asset_name=remote_name, asset_size=remote_size)
-    if local_size is None:
-        return RemoteCheck("ok", f"远端资产 {human_size(remote_size)}",
-                           exists=True, has_asset=True, asset_name=remote_name,
-                           asset_size=remote_size)
-    if remote_size == local_size:
-        return RemoteCheck("ok", f"{human_size(remote_size)}", exists=True, has_asset=True,
-                           asset_name=remote_name, asset_size=remote_size)
-    return RemoteCheck("size-mismatch",
-                       f"本地 {human_size(local_size)}，远端 {human_size(remote_size)}",
-                       exists=True, has_asset=True, asset_name=remote_name,
-                       asset_size=remote_size)
+        detail = "release 是草稿（未发布）"
+        if book.form == "none":
+            detail = "release 是草稿且没有资产"
+        return RemoteCheck("draft", detail, form=book.form, is_draft=True)
+    if book.form == "none":
+        return RemoteCheck("no-asset", "release 里没有这个文件", form="none")
+    if book.form == "pdf":
+        return RemoteCheck(
+            "form-changed",
+            "资产形态变了（旧版是单个 .pdf，现在传 .tar.xz / 分卷）",
+            form="pdf",
+        )
+
+    remote_items = _expected_remote_items(book)
+    if book.form == "parts":
+        indexes = book.part_indexes
+        if indexes != list(range(len(indexes))):
+            missing = sorted(set(range(indexes[-1] + 1)) - set(indexes)) if indexes else []
+            detail = "分卷不齐"
+            if missing:
+                detail += "，缺 " + ", ".join(f".part.{n:02d}" for n in missing)
+            return RemoteCheck("incomplete", detail, form="parts")
+
+    expected = (old or {}).get("archive") or {}
+    expected_parts = expected.get("parts") if isinstance(expected, dict) else None
+    if isinstance(expected_parts, list) and expected_parts:
+        if len(expected_parts) != len(remote_items):
+            return RemoteCheck(
+                "incomplete",
+                f"分卷数量不一致（账本 {len(expected_parts)} 个，远端 {len(remote_items)} 个）",
+                form=book.form,
+            )
+        for exp, got in zip(expected_parts, remote_items):
+            exp_name = asset_name_key(str(exp.get("name") or ""))
+            got_name = asset_name_key(str(got.get("name") or ""))
+            if exp_name != got_name:
+                return RemoteCheck(
+                    "incomplete",
+                    f"分卷名不一致（账本 {exp.get('name')!r}，远端 {got.get('name')!r}）",
+                    form=book.form,
+                )
+            if _asset_size(got) != exp.get("size"):
+                return RemoteCheck(
+                    "incomplete",
+                    f"分卷大小不一致（{got.get('name')!r}："
+                    f"账本 {exp.get('size')}，远端 {_asset_size(got)}）",
+                    form=book.form,
+                )
+    total = sum(_asset_size(asset) or 0 for asset in remote_items)
+    detail = f"{len(remote_items)} 个资产，共 {human_size_mb(total)}"
+    return RemoteCheck("ok", detail, form=book.form)
 
 
 # ---------------------------------------------------------------------------
@@ -451,11 +722,33 @@ ITEM_LINE_RE = re.compile(
 
 @dataclass
 class BlockEntry:
-    """index.md 托管块里的一行：`N. [label](url) · 大小 · sha256:xxxxxxxx`。"""
+    """index.md 托管块里的一行：`N. [label](url) · 大小 · sha256:xxxxxxxx · mtime`。"""
 
     label: str
     url: str
-    extra: str = ""   # 链接后面那段（大小 / hash）；旧格式的行可能为空，原样保留
+    extra: str = ""   # 链接后面那段（大小 / hash / mtime）；旧格式的行可能为空，原样保留
+
+
+@dataclass
+class BlockExtra:
+    size_text: str = ""
+    sha_prefix: str = ""
+    mtime_text: str = ""
+
+
+def parse_block_extra(extra: str) -> BlockExtra:
+    parsed = BlockExtra()
+    for token in (extra or "").split("·"):
+        text = token.strip()
+        if not text:
+            continue
+        if text.lower().startswith("sha256:"):
+            parsed.sha_prefix = text.split(":", 1)[1].strip()
+        elif re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", text):
+            parsed.mtime_text = text
+        elif re.fullmatch(r"[\d.]+\s*[KMG]?B", text, re.IGNORECASE):
+            parsed.size_text = text
+    return parsed
 
 
 def parse_block_items(text: str) -> list[BlockEntry] | None:
@@ -481,16 +774,18 @@ def render_block(items: list[Item], index_dir: Path,
                  preserved: list[tuple[str, BlockEntry]] = ()) -> str:
     """渲染托管块。
 
-    每行：`N. [相对路径](release 链接) · <十进制大小> · sha256:<前 8 位>`
-    （完整 hash 在账本里；前 8 位够人肉核对，也够和 `sha256sum` 输出对照）。
+    每行：`N. [相对路径](release 链接) · <十进制大小> · sha256:<前 8 位> · <mtime>`
+    （大小用十进制，和 release 页一致；完整 hash 在账本里）。
 
     preserved 是 [(rel, BlockEntry)]：扫描范围之外、但本来就记在这个 index.md 块里的
-    旧条目。cwd 之上的 index.md 被更新时用它保住范围外的链接和它们原来的大小/hash，
+    旧条目。cwd 之上的 index.md 被更新时用它保住范围外的链接和它们原来的尾巴，
     免得整块被覆盖掉。
     """
     rows: dict[str, tuple[str, str, str]] = {}
     for item in items:
-        extra = f"· {human_size_mb(item.size)} · sha256:{item.sha[:8]}"
+        extra = (
+            f"· {human_size_mb(item.size)} · sha256:{item.sha[:8]} · {item.mtime_text}"
+        )
         rows[item.rel] = (rel_posix(item.pdf, index_dir), item.url, extra)
     for rel, entry in preserved:
         rows.setdefault(rel, (entry.label, entry.url, entry.extra))
@@ -563,9 +858,9 @@ def print_gh_troubleshooting(repo: str, action: str = "上传") -> None:
   2) token 权限必须包含 repo（{action} release 必需）
      只读 token 的典型报错：HTTP 403: Resource not accessible by personal access token
      重新授权带上 scope：gh auth login -h github.com -s repo
-  3) GitHub Release 单个文件上限 2GB；超了请拆分 PDF，或换别的方式托管
-  4) 网络 / 代理：确认能访问 https://api.github.com（公司网、代理经常拦）
-  5) 仓库和权限：确认 {repo} 已创建，且当前账号对它至少有写权限
+  3) 网络 / 代理：确认能访问 https://api.github.com 和 https://uploads.github.com
+  4) 仓库和权限：确认 {repo} 已创建，且当前账号对它至少有写权限
+  5) 分卷都是 10 MiB，不会碰到 GitHub 单个资产 2GB 的上限
 """)
 
 
@@ -657,34 +952,45 @@ def rollback(root: Path, originals: dict[Path, bytes | None], branch: str, reaso
 
 
 # ---------------------------------------------------------------------------
-# 主流程
+# 参数 / 计划输出
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="books/gbb",
-        description="把 books/ 下的 PDF 发到 GitHub Release，并写回最近 index.md 的下载链接。",
+        description="把 books/ 下的 PDF 压成 tar.xz（过大分卷）发到 GitHub Release，"
+                    "并把下载链接写回最近 index.md 的托管块。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--dry-run", action="store_true",
-                        help="只打印计划：不写文件、不提交、不推送、不上传")
+                        help="只打印计划：不写文件、不压缩、不提交、不推送、不上传")
     parser.add_argument("--pull", action="store_true",
-                        help="下载当前目录范围内本地缺失的 PDF（不改 index.md、不提交、不推送）")
+                        help="按 index.md 托管块下载当前目录范围内本地缺失的 PDF"
+                             "（不改 index.md、不提交、不推送）")
     parser.add_argument("--all", action="store_true",
                         help="扫描整个仓库（默认只扫描当前工作目录及其子目录）")
     parser.add_argument("--yes", action="store_true",
                         help="跳过所有询问（两处都按默认答案执行）")
     parser.add_argument("--no-verify", action="store_true",
                         help="跳过远端核对，只信本地账本（默认每次都会 gh release view 核对远端）")
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS,
+                        help=f"并发上传/下载的分卷数（默认 {DEFAULT_JOBS}；"
+                             f"1 = 单个分卷一条真实进度条）")
+    parser.add_argument("--keep-temp", action="store_true",
+                        help="上传成功后保留 .<pdf>.gbb_tar_dir（默认清理；失败时总会保留）")
     parser.add_argument("--repo", default=DEFAULT_REPO,
                         help=f"GitHub 仓库 owner/name（默认 {DEFAULT_REPO}）")
     parser.add_argument("--branch", default=DEFAULT_BRANCH,
                         help=f"要提交/推送的分支（默认 {DEFAULT_BRANCH}）")
+    parser.add_argument("--verbose", action="store_true",
+                        help="打印实际执行的命令与远端核对细节")
     parser.add_argument("--debug", action="store_true",
-                        help="打印实际执行的命令与 gh 原始输出")
+                        help="同 --verbose（保留兼容）")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", args.repo):
         parser.error("--repo 的格式应该是 owner/name，例如 allinkernel/wblog-books")
+    if args.jobs < 1 or args.jobs > 64:
+        parser.error("--jobs 要在 1..64 之间")
     return args
 
 
@@ -693,7 +999,7 @@ def item_status_text(item: Item) -> str:
     if item.kind == "new":
         return "新增"
     if item.kind == "changed":
-        return "变更"
+        return f"变更：{item.reason}"
     if item.kind == "reupload":
         return f"需补传：{item.reason}"
     if item.verify_label == "--no-verify":
@@ -710,34 +1016,36 @@ def print_items(items: list[Item]) -> None:
             print(f"         tag ：{item.tag}（补传继续用这个旧 tag，不新建）")
         else:
             print(f"         tag ：{item.tag}")
+        print(f"         mtime：{item.mtime_text} · sha256:{item.sha[:8]}")
         if item.kind == "changed" and item.old and item.old.get("tag"):
             print(f"         旧 tag：{item.old['tag']}（保留在 GitHub 上，不删）")
 
 
-def print_upload_plan(item: Item, repo: str) -> None:
-    """上传这一步会干什么（dry-run 只打印，不跑 curl）。"""
-    if item.upload_mode == "upload":
-        print(f"  # {item.rel}：release 已存在（{item.tag}），不重建")
-    elif item.upload_mode == "create":
-        print(f"  # {item.rel}：先建一个空 release（--draft，不带资产）再传")
-        print(f"  gh release create {item.tag} --repo {repo} --draft --title <...> --notes <...>")
-    else:
-        print(f"  # {item.rel}：上传前先核对 release 是否已存在（不存在才建空草稿）")
-        print(f"  gh release view {item.tag} --repo {repo}   # 判断 release 是否已存在")
-        print(f"  gh release create {item.tag} --repo {repo} --draft --title <...> --notes <...>"
-              f"   # 不存在时")
-    print(f"  gh release view {item.tag} --repo {repo} --json databaseId,isDraft"
-          f"   # 取 release id")
-    print(f"  curl -T <pdf> --progress-bar -X POST -H 'Content-Type: application/pdf' "
-          f"-K - --fail \\")
-    print(f"       'https://uploads.github.com/repos/{repo}/releases/<id>/assets"
-          f"?name=<远端归一化名>'")
-    print("       # token 由 `gh auth token` 取，只经 stdin（-K -）喂给 curl，不进命令行")
+def shq(value: object) -> str:
+    return shlex.quote(str(value))
+
+
+def print_upload_plan(item: Item, args: argparse.Namespace) -> None:
+    """上传这一步会执行的关键命令（dry-run 只打印，不压缩、不跑 curl）。"""
+    tmp = tmp_dir_for(item.pdf)
+    archive = tmp / archive_name_for(item.pdf)
+    print(f"  [{item.rel}]")
+    print(f"  tar -C {shq(item.pdf.parent)} --use-compress-program={shq(XZ_PROGRAM)} "
+          f"-cf {shq(archive)} -- {shq(item.pdf.name)}")
+    print(f"  split -b {SPLIT_SIZE_ARG} -d -a 2 {shq(archive)} {shq(str(archive) + '.part.')}"
+          f"  （产物 > 10 MiB 时）")
+    if item.upload_mode == "create":
+        print(f"  gh release create {item.tag} --repo {args.repo} --draft "
+              f"--title <...> --notes <...>")
+    elif item.upload_mode == "unknown":
+        print(f"  gh release create {item.tag} --repo {args.repo} --draft "
+              f"--title <...> --notes <...>  （release 不存在时）")
+    print(f"  gh release view {item.tag} --repo {args.repo} --json databaseId,isDraft")
+    print(f"  curl -T <分卷> -X POST -H 'Content-Type: {CONTENT_TYPE}' -K - --fail "
+          f"'https://uploads.github.com/repos/{args.repo}/releases/<id>/assets?name=<分卷名>'"
+          f"  （--jobs {args.jobs} 并发）")
     if item.upload_mode != "upload" or item.is_draft:
-        print(f"  gh release edit {item.tag} --repo {repo} --draft=false"
-              f"   # 上传完再把草稿发布出去")
-    print(f"  # 回退：没有 curl / 不是交互式终端 / curl 失败 → "
-          f"gh release upload {item.tag} <pdf> --repo {repo} --clobber（没有进度条）")
+        print(f"  gh release edit {item.tag} --repo {args.repo} --draft=false")
 
 
 def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.Namespace,
@@ -752,14 +1060,11 @@ def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.N
 
     print("\n将执行：")
     rels = sorted({rel_posix(p, root) for p in index_changes} | ({LEDGER_NAME} if ledger_changed else set()))
-    print(f"  git -C {root} add -- {' '.join(rels)}")
-    print(f"  git -C {root} commit -F <提交信息> -- {' '.join(rels)}")
-    print(f"  git -C {root} push origin {args.branch}")
-    if todo:
-        print("  # 上传走 curl -T + --progress-bar（真实进度条）；"
-              "没有 curl / 不是交互式终端 / curl 失败会自动退回 gh（没有进度条）")
+    print(f"  git -C {shq(root)} add -- {' '.join(shq(r) for r in rels)}")
+    print(f"  git -C {shq(root)} commit -F <提交信息> -- {' '.join(shq(r) for r in rels)}")
+    print(f"  git -C {shq(root)} push origin {args.branch}")
     for item in todo:
-        print_upload_plan(item, args.repo)
+        print_upload_plan(item, args)
 
 
 def build_commit_message(todo: list[Item]) -> str:
@@ -775,6 +1080,7 @@ def build_commit_message(todo: list[Item]) -> str:
         for item in new_items:
             lines.append(f"- {item.rel}")
             lines.append(f"  tag: {item.tag}")
+            lines.append(f"  mtime: {item.mtime_text} · sha256: {item.sha[:12]}")
     if changed_items:
         if new_items:
             lines.append("")
@@ -782,6 +1088,7 @@ def build_commit_message(todo: list[Item]) -> str:
         for item in changed_items:
             lines.append(f"- {item.rel}")
             lines.append(f"  tag: {item.tag}（旧 tag: {item.old.get('tag') if item.old else '无'}）")
+            lines.append(f"  原因: {item.reason} · mtime: {item.mtime_text}")
     if reupload_items:
         if new_items or changed_items:
             lines.append("")
@@ -790,9 +1097,14 @@ def build_commit_message(todo: list[Item]) -> str:
             lines.append(f"- {item.rel}")
             lines.append(f"  tag: {item.tag}（{item.reason}）")
     lines.append("")
-    lines.append("index.md 的「下载链接」块由 books/gbb 自动生成，别手改。")
+    lines.append("index.md 的「下载链接」块由 books/gbb 自动生成，别手改；")
+    lines.append("资产是 .tar.xz（过大按 10 MiB 分卷），旧 release 不删。")
     return "\n".join(lines) + "\n"
 
+
+# ---------------------------------------------------------------------------
+# 上传：压缩产物（分卷）并发 curl
+# ---------------------------------------------------------------------------
 
 def fetch_release_id(repo: str, tag: str) -> tuple[int | None, bool, str]:
     """取 release 的 databaseId（curl 上传要用）+ isDraft。只读。"""
@@ -819,7 +1131,7 @@ def fetch_release_id(repo: str, tag: str) -> tuple[int | None, bool, str]:
 def gh_auth_token() -> str:
     """从 `gh auth token` 取 token。
 
-    ⚠️ 只放内存：不打印、不进 debug 日志、**不进 curl 的 argv**（见 _upload_with_curl）。
+    ⚠️ 只放内存：不打印、不进 debug 日志、**不进 curl 的 argv**（见 _curl_upload）。
     `gh auth token` 的输出里就是凭据，所以这里故意不走会打日志的 run()。
     """
     try:
@@ -831,18 +1143,134 @@ def gh_auth_token() -> str:
     return proc.stdout.strip()
 
 
-def progress_bar_status() -> tuple[bool, str]:
-    """能不能用 curl --progress-bar 显示**真实**进度；不能就给出原因（调用方退回 gh）。
+class UploadProgress:
+    """并发上传时的汇总进度行：只统计**已完成**的分卷，绝不编造。"""
 
-    非交互式（stdout 不是终端）时进度条只会变成一堆 `\\r`，宁可不画；
-    标准输入不是终端（`</dev/null` / 管道）也算非交互式，同样不画。
+    def __init__(self, total_parts: int, total_bytes: int, tty: bool):
+        self.total_parts = total_parts
+        self.total_bytes = total_bytes
+        self.tty = tty
+        self.interval = 2.0 if tty else 10.0
+        self.done_parts = 0
+        self.done_bytes = 0
+        self.started = time.monotonic()
+        self.last_print = 0.0
+        self.width = 0
+        self.lock = threading.Lock()
+
+    def _line(self) -> str:
+        elapsed = max(time.monotonic() - self.started, 1e-9)
+        rate = self.done_bytes / elapsed
+        return (f"已完成 {self.done_parts}/{self.total_parts} 个分卷 · "
+                f"已传 {human_size_mb(self.done_bytes)} / {human_size_mb(self.total_bytes)} · "
+                f"{human_rate(rate)}")
+
+    def render(self, force: bool = False, final: bool = False) -> None:
+        with self.lock:
+            now = time.monotonic()
+            if not force and not final and now - self.last_print < self.interval:
+                return
+            self.last_print = now
+            text = self._line()
+            if self.tty:
+                pad = max(0, self.width - len(text))
+                sys.stdout.write("\r" + text + " " * pad)
+                if final:
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+                self.width = max(self.width, len(text))
+            else:
+                print("  " + text, flush=True)
+
+    def add(self, nbytes: int) -> None:
+        with self.lock:
+            self.done_parts += 1
+            self.done_bytes += nbytes
+        self.render()
+
+    def ticker(self, stop: threading.Event) -> None:
+        while not stop.wait(0.5):
+            self.render()
+
+
+def _curl_upload(args: argparse.Namespace, part: ArchivePart, release_id: int,
+                 token: str, progress_bar: bool) -> tuple[bool, str]:
+    """单个分卷走 curl 上传。
+
+    ⚠️ token 只写进 `-K -` 从 stdin 读的配置里
+    （`header = "Authorization: token <token>"`），**绝不放进 argv**。
+    进度条画在 stderr 上：progress_bar=True 时不捕获 stderr，让它直接进终端；
+    并发时不画进度条（`-sS`），stderr 捕获下来只用于报错。
     """
-    if not sys.stdout.isatty():
-        return False, "当前输出不是交互式终端（sys.stdout.isatty() 为假）"
-    if not sys.stdin.isatty():
-        return False, "标准输入不是终端（</dev/null 或管道）"
-    if shutil.which("curl") is None:
-        return False, "本机没有 curl"
+    asset_name = asset_name_key(part.name)
+    upload_url = UPLOAD_API_TMPL.format(
+        repo=args.repo, release_id=release_id, name=quote(asset_name, safe=""),
+    )
+    config_text = f'header = "Authorization: token {token}"\n'
+    cmd = ["curl"]
+    cmd += ["--progress-bar"] if progress_bar else ["-sS"]
+    cmd += [
+        "-T", str(part.path), "-X", "POST",
+        "-H", f"Content-Type: {CONTENT_TYPE}",
+        "-K", "-", "--fail", upload_url,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=config_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=None if progress_bar else subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        return False, f"找不到 curl：{exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip() if not progress_bar else ""
+        if detail:
+            detail = detail.splitlines()[-1][:300]
+        return False, detail or f"curl 退出码 {proc.returncode}"
+    return True, ""
+
+
+def _gh_upload(args: argparse.Namespace, item: Item, part: ArchivePart) -> tuple[bool, str]:
+    proc = run(["gh", "release", "upload", item.tag, str(part.path),
+                "--repo", args.repo, "--clobber"])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return False, detail or f"gh 退出码 {proc.returncode}"
+    return True, ""
+
+
+def _upload_one(args: argparse.Namespace, item: Item, part: ArchivePart,
+                release_id: int, token: str, use_curl: bool,
+                force_gh: bool, progress_bar: bool) -> tuple[bool, str, str]:
+    """传一个分卷：优先 curl；没有 curl / 失败 / 需要覆盖时退回 gh --clobber。"""
+    if use_curl and not force_gh:
+        ok, why = _curl_upload(args, part, release_id, token, progress_bar)
+        if ok:
+            return True, "", "curl"
+        with PRINT_LOCK:
+            print(f"  ⚠️ {part.name}：curl 上传失败（{why}），改用 gh release upload --clobber")
+    ok, why = _gh_upload(args, item, part)
+    return ok, "" if ok else why, "gh"
+
+
+def verify_remote_parts(args: argparse.Namespace, item: Item,
+                        archive: ArchiveInfo) -> tuple[bool, str]:
+    """传完再核一次远端：每个分卷都在、大小都对。核对失败只警告，不误判上传失败。"""
+    meta = fetch_remote_release(args.repo, item.tag)
+    if meta.state == "error":
+        print(f"  ⚠️ 上传后核对失败（{meta.detail or 'gh 没输出原因'}），按已上传处理")
+        return True, ""
+    if meta.state == "no-release":
+        return False, "上传后远端还是找不到这个 release"
+    book = classify_book_assets(meta.assets, item.pdf.name)
+    remote = {}
+    for asset in _expected_remote_items(book):
+        remote[asset_name_key(str(asset.get("name") or ""))] = _asset_size(asset)
+    for part in archive.parts:
+        if remote.get(asset_name_key(part.name)) != part.size:
+            return False, f"远端资产缺失或大小不符：{part.name}"
     return True, ""
 
 
@@ -862,104 +1290,123 @@ def _publish_draft_if_needed(args: argparse.Namespace, item: Item,
     return True, ""
 
 
-def _upload_with_gh(args: argparse.Namespace, item: Item, is_draft: bool,
-                    why: str) -> tuple[bool, str]:
-    """没有真实进度时的退路：gh release upload --clobber（明说没有进度条，不编造）。"""
-    print(f"  这次没有进度条：{why}。")
-    print(f"  正在上传 {human_size_mb(item.size)}，{upload_eta_text(item.size)}"
-          f"（按实测约 0.2 MB/s 估算，只是估算、不是真实进度）。")
-    started = time.monotonic()
-    cmd = ["gh", "release", "upload", item.tag, item.pdf, "--repo", args.repo, "--clobber"]
-    try:
-        proc = run(cmd)
-    except ToolError as exc:
-        print(f"  失败：{exc}")
-        return False, str(exc)
-    elapsed = time.monotonic() - started
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()
-        print(f"  失败：{detail or '（gh 没输出原因）'}")
-        return False, detail or "gh 返回非 0"
-    print(f"  上传完成：{human_size_mb(item.size)}，用时 {elapsed_text(elapsed)}"
-          f"（实测 {upload_speed_text(item.size, elapsed)}）")
-    return _publish_draft_if_needed(args, item, is_draft)
+def upload_archive(args: argparse.Namespace, item: Item, archive: ArchiveInfo,
+                   release_id: int, is_draft: bool, token: str) -> tuple[bool, str]:
+    """把一个 release 的全部分卷传上去（并发），必要时发布草稿。"""
+    use_curl = bool(token) and shutil.which("curl") is not None
+    if not use_curl:
+        print("  没有 curl / 取不到 token，改用 gh release upload（没有进度条）")
 
+    meta = fetch_remote_release(args.repo, item.tag)
+    remote_assets = meta.assets if meta.state == "ok" else []
+    remote_map: dict[str, dict] = {}
+    for asset in remote_assets:
+        if isinstance(asset, dict):
+            remote_map[asset_name_key(str(asset.get("name") or ""))] = asset
 
-def _upload_with_curl(args: argparse.Namespace, item: Item, release_id: int) -> tuple[bool, str]:
-    """curl -T + --progress-bar 上传资产（唯一能给出真实进度的做法）。
+    pending: list[ArchivePart] = []
+    done_bytes = 0
+    done_parts = 0
+    force_gh: set[str] = set()
+    for part in archive.parts:
+        asset = remote_map.get(asset_name_key(part.name))
+        if asset is not None and _asset_size(asset) == part.size:
+            done_bytes += part.size
+            done_parts += 1
+            continue
+        if asset is not None:
+            # 同名资产还在但大小不对：curl 新建会 422，直接走 gh --clobber。
+            force_gh.add(part.name)
+        pending.append(part)
 
-    ⚠️ token 红线：token 只写进 `-K -` 从 stdin 读的配置里
-    （`header = "Authorization: token <token>"`），**绝不放进 argv** ——
-    进程列表、`ps`、shell 历史、debug 日志里都不该出现它。
-    curl 的进度条画在 stderr 上，所以这里**不捕获 stderr**（让它直接进终端）；
-    stdout 是 GitHub 返回的 JSON，捕获下来但不打印（里面没有 token）。
-    """
-    token = gh_auth_token()
-    if not token:
-        print("  ⚠️ 取不到 gh token（gh auth token 失败或没登录）")
-        return False, "取不到 gh token"
-    asset_name = asset_name_key(item.pdf.name)
-    upload_url = UPLOAD_API_TMPL.format(
-        repo=args.repo, release_id=release_id, name=quote(asset_name, safe=""),
-    )
-    config_text = f'header = "Authorization: token {token}"\n'
-    cmd = [
-        "curl", "-T", str(item.pdf), "--progress-bar", "-X", "POST",
-        "-H", "Content-Type: application/pdf", "-K", "-", "--fail", upload_url,
-    ]
-    print(f"  curl 正在上传 {human_size_mb(item.size)}（真实进度条由 curl 画）…")
-    started = time.monotonic()
-    try:
-        proc = subprocess.run(
-            [str(c) for c in cmd],
-            input=config_text,
-            text=True,
-            stdout=subprocess.PIPE,   # GitHub 的 JSON 响应
-            stderr=None,              # 进度条直接进终端，不能吞掉
-        )
-    except FileNotFoundError as exc:
-        print(f"  ⚠️ 调不起 curl：{exc}")
-        return False, "找不到 curl"
-    elapsed = time.monotonic() - started
-    if proc.returncode != 0:
-        print(f"  ⚠️ curl 上传失败（退出码 {proc.returncode}）")
-        return False, f"curl 退出码 {proc.returncode}"
-    print(f"  上传完成：{human_size_mb(item.size)}，用时 {elapsed_text(elapsed)}"
-          f"（实测 {upload_speed_text(item.size, elapsed)}）")
+    if not pending:
+        print(f"  {done_parts} 个分卷远端都已在，跳过上传")
+    else:
+        if done_parts:
+            print(f"  {done_parts} 个分卷远端已在，只传缺的 {len(pending)} 个")
+        tty = sys.stdout.isatty()
+        bar_mode = use_curl and args.jobs == 1 and tty and len(pending) > 0
+        started = time.monotonic()
+        if bar_mode:
+            for part in pending:
+                label = f"  上传 {part.name}（{human_size_mb(part.size)}）"
+                print(label)
+                ok, why, _how = _upload_one(
+                    args, item, part, release_id, token, use_curl,
+                    part.name in force_gh, progress_bar=True,
+                )
+                if not ok:
+                    return False, f"{part.name} 上传失败：{why}"
+            total = sum(part.size for part in pending)
+            elapsed = time.monotonic() - started
+            print(f"  已上传 {len(pending)} 个分卷 · 共 {human_size_mb(total)} · "
+                  f"用时 {elapsed_text(elapsed)}（实测 {upload_speed_text(total, elapsed)}）")
+        else:
+            progress = UploadProgress(len(archive.parts), archive.total_size, tty)
+            if done_parts:
+                progress.done_parts = done_parts
+                progress.done_bytes = done_bytes
+            progress.render(force=True)
+            stop = threading.Event()
+            ticker = threading.Thread(target=progress.ticker, args=(stop,), daemon=True)
+            ticker.start()
+            errors: list[tuple[str, str]] = []
+            try:
+                with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                    futures = {
+                        pool.submit(
+                            _upload_one,
+                            args, item, part, release_id, token, use_curl,
+                            part.name in force_gh, False,
+                        ): part
+                        for part in pending
+                    }
+                    for future in as_completed(futures):
+                        part = futures[future]
+                        try:
+                            ok, why, _how = future.result()
+                        except Exception as exc:  # 线程里的意外也要报出来
+                            ok, why = False, str(exc)
+                        if ok:
+                            progress.add(part.size)
+                        else:
+                            errors.append((part.name, why or "上传失败"))
+            finally:
+                stop.set()
+                ticker.join(timeout=1.0)
+                progress.render(final=True, force=True)
+            if errors:
+                for name, why in errors:
+                    print(f"  ✗ {name}：{why}")
+                return False, f"{len(errors)} 个分卷上传失败"
+
+    if is_draft:
+        ok, why = _publish_draft_if_needed(args, item, True)
+        if not ok:
+            return False, why
+    ok, why = verify_remote_parts(args, item, archive)
+    if not ok:
+        return False, why
     return True, ""
-
-
-def _upload_asset(args: argparse.Namespace, item: Item, is_draft: bool) -> tuple[bool, str]:
-    """release 已经存在：把 PDF 传上去，能画真实进度就画，不行/失败就退回 gh。"""
-    release_id, remote_draft, detail = fetch_release_id(args.repo, item.tag)
-    is_draft = is_draft or remote_draft
-    usable, why = progress_bar_status()
-    if release_id is None:
-        print(f"  ⚠️ 取不到 release id（{detail}），没法定 curl 的上传地址")
-        return _upload_with_gh(args, item, is_draft, "取不到 release id")
-    if usable:
-        ok, _ = _upload_with_curl(args, item, release_id)
-        if ok:
-            return _publish_draft_if_needed(args, item, is_draft)
-        print("  ⚠️ 自动退回 gh release upload --clobber（这次没有进度条）")
-        return _upload_with_gh(args, item, is_draft, "curl 上传失败")
-    return _upload_with_gh(args, item, is_draft, why)
 
 
 def do_uploads(args: argparse.Namespace, root: Path, todo: list[Item]) -> list[tuple[Item, str]]:
     """返回失败列表 [(item, 原因)]。"""
     failures: list[tuple[Item, str]] = []
+    token = gh_auth_token()
     for num, item in enumerate(todo, 1):
         print(f"\n[{num}/{len(todo)}] {item.rel}")
-        if item.size > MAX_RELEASE_BYTES:
-            reason = f"文件 {human_size(item.size)} 超过 GitHub Release 单文件 2GB 上限"
-            print(f"  失败：{reason}")
-            failures.append((item, reason))
-            continue
+        archive = item.archive_info
+        if archive is None:
+            failures.append((item, "内部错误：没有准备好压缩分卷"))
+            break
+        with PRINT_LOCK:
+            print(f"  上传 {len(archive.parts)} 个资产，共 {human_size_mb(archive.total_size)}"
+                  f"（PDF {human_size_mb(item.size)}）")
         notes = (
             f"来源目录：{dir_label(item.pdf.parent, root)}；"
-            f"大小：{human_size(item.size)}；"
-            f"sha256：{item.sha[:12]}"
+            f"PDF 大小：{human_size_mb(item.size)}；"
+            f"sha256：{item.sha[:12]}；mtime：{item.mtime_text}"
         )
         title = f"{dir_label(item.pdf.parent, root)} / {item.pdf.name}"
 
@@ -981,48 +1428,68 @@ def do_uploads(args: argparse.Namespace, root: Path, todo: list[Item]) -> list[t
                           f"{meta.detail or '（gh 没输出原因）'}")
                     mode, is_draft = "create", False
 
-        ok = True
-        reason = ""
-        if mode == "upload":
-            print("  release 已存在，不重建（沿用原来的 tag）")
-            ok, reason = _upload_asset(args, item, is_draft)
-        else:
-            usable, why = progress_bar_status()
-            if usable:
-                # curl 上传要 release id：先建一个**空草稿**（不带资产），传完再发布，
-                # 免得中途公开一个 0 资产的 release（index.md 已经先推上去了）。
-                print("  先建一个空 release（--draft，不带资产），再用 curl 上传并显示进度")
-                create = run(["gh", "release", "create", item.tag, "--repo", args.repo,
-                              "--title", title, "--notes", notes, "--draft"])
-                if create.returncode != 0:
-                    detail = (create.stderr or create.stdout).strip()
+        release_id: int | None = None
+        if mode == "create":
+            print("  建 release（--draft，不带资产）")
+            create = run(["gh", "release", "create", item.tag, "--repo", args.repo,
+                          "--title", title, "--notes", notes, "--draft"])
+            if create.returncode != 0:
+                detail = (create.stderr or create.stdout).strip()
+                release_id, remote_draft, _detail = fetch_release_id(args.repo, item.tag)
+                if release_id is None:
                     print(f"  失败：{detail or '（gh 没输出原因）'}")
                     failures.append((item, detail or "gh 返回非 0"))
                     break  # 多半是登录/权限/网络问题，后面的不再硬试
-                ok, reason = _upload_asset(args, item, True)
-            else:
-                # 没有真实进度可画：沿用一次搞定的 gh release create（带资产），
-                # 只报大小和按实测带宽估的时间，绝不假装有进度。
-                print(f"  这次没有进度条：{why}。")
-                print(f"  正在建 release 并上传 {human_size_mb(item.size)}，"
-                      f"{upload_eta_text(item.size)}"
-                      f"（按实测约 0.2 MB/s 估算，只是估算、不是真实进度）。")
-                started = time.monotonic()
-                create = run(["gh", "release", "create", item.tag, item.pdf, "--repo", args.repo,
-                              "--title", title, "--notes", notes])
-                elapsed = time.monotonic() - started
-                if create.returncode != 0:
-                    detail = (create.stderr or create.stdout).strip()
-                    print(f"  失败：{detail or '（gh 没输出原因）'}")
-                    failures.append((item, detail or "gh 返回非 0"))
-                    break
-                print(f"  上传完成：{human_size_mb(item.size)}，用时 {elapsed_text(elapsed)}"
-                      f"（实测 {upload_speed_text(item.size, elapsed)}）")
+                print("  release 已经存在了，改走上传（不重建）")
+                is_draft = is_draft or remote_draft
+                mode = "upload"
+
+        if release_id is None:
+            release_id, remote_draft, detail = fetch_release_id(args.repo, item.tag)
+            if release_id is None:
+                print(f"  ⚠️ 取不到 release id（{detail}），没法定 curl 的上传地址")
+                failures.append((item, detail or "取不到 release id"))
+                break
+            is_draft = is_draft or remote_draft
+
+        ok, reason = upload_archive(args, item, archive, release_id, is_draft, token)
         if not ok:
+            print(f"  失败：{reason}")
             failures.append((item, reason or "上传失败"))
             break
+        cleanup_temp(archive, args.keep_temp)
         print(f"  完成：{item.url}")
     return failures
+
+
+# ---------------------------------------------------------------------------
+# --pull：以 index.md 托管块为准
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PullRecord:
+    rel: str
+    tag: str = ""
+    size: int | None = None
+    size_text: str = ""
+    sha_full: str = ""
+    sha_prefix: str = ""
+    mtime_text: str = ""
+    sources: list[str] = field(default_factory=list)
+    archive: dict | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PullJob:
+    rec: PullRecord
+    target: Path
+    tmp: Path
+    pdf_name: str
+    form: str                     # parts / single / pdf / glob
+    asset_names: list[str] = field(default_factory=list)
+    asset_sizes: list[int] = field(default_factory=list)
+    fallback_glob: str = ""
 
 
 def _tag_from_url(url: str) -> str:
@@ -1057,27 +1524,16 @@ def index_files_covering(scan_root: Path, root: Path) -> list[Path]:
     return unique
 
 
-def collect_pull_records(root: Path, scan_root: Path, ledger: dict) -> dict[str, dict]:
-    """账本 + index.md 托管块 -> {rel: {tags, sources, size}}，只留 cwd 子树内的。"""
-    records: dict[str, dict] = {}
+def collect_pull_records(root: Path, scan_root: Path, ledger: dict) -> dict[str, PullRecord]:
+    """以 index.md 托管块为准收集下载记录，账本补全 sha256 / 大小。
 
-    def add(rel: str, tag: str, source: str, size: int | None = None) -> None:
-        if not is_under(root / rel, scan_root):
-            return
-        info = records.setdefault(rel, {"tags": [], "sources": [], "size": None})
-        if tag and tag not in info["tags"]:
-            info["tags"].append(tag)
-        if source not in info["sources"]:
-            info["sources"].append(source)
-        if size is not None and info.get("size") is None:
-            info["size"] = size
+    index.md 是"已经发布的下载链接"的权威；账本里可能有更完整的 sha256，
+    也可能有 index.md 没记到的旧文件（legacy），所以两边并集，index.md 的 tag 优先。
+    """
+    records: dict[str, PullRecord] = {}
 
-    for rel, value in sorted(ledger.items()):
-        if not isinstance(value, dict):
-            continue
-        size = value.get("size")
-        add(rel, value.get("tag") or "", LEDGER_NAME,
-            size if isinstance(size, int) and not isinstance(size, bool) else None)
+    def get(rel: str) -> PullRecord:
+        return records.setdefault(rel, PullRecord(rel=rel))
 
     for index_md in index_files_covering(scan_root, root):
         try:
@@ -1094,16 +1550,258 @@ def collect_pull_records(root: Path, scan_root: Path, ledger: dict) -> dict[str,
                 rel = (index_dir / entry.label).resolve().relative_to(root.resolve()).as_posix()
             except (OSError, ValueError):
                 continue
-            add(rel, _tag_from_url(entry.url), rel_posix(index_md, root))
+            if not is_under(root / rel, scan_root):
+                continue
+            rec = get(rel)
+            tag = _tag_from_url(entry.url)
+            extra = parse_block_extra(entry.extra)
+            source = rel_posix(index_md, root)
+            if source not in rec.sources:
+                rec.sources.append(source)
+            if tag and rec.tag and rec.tag != tag:
+                rec.warnings.append(f"{source} 的 tag（{tag}）和已收集到的（{rec.tag}）不一致")
+            elif tag and not rec.tag:
+                rec.tag = tag
+            if extra.sha_prefix and not rec.sha_prefix:
+                rec.sha_prefix = extra.sha_prefix
+            if extra.size_text and not rec.size_text:
+                rec.size_text = extra.size_text
+            if extra.mtime_text and not rec.mtime_text:
+                rec.mtime_text = extra.mtime_text
+
+    for rel, value in sorted(ledger.items()):
+        if not isinstance(value, dict):
+            continue
+        if not is_under(root / rel, scan_root):
+            continue
+        rec = get(rel)
+        if LEDGER_NAME not in rec.sources:
+            rec.sources.append(LEDGER_NAME)
+        tag = value.get("tag") or ""
+        if tag and rec.tag and rec.tag != tag:
+            rec.warnings.append(f"账本的 tag（{tag}）和 index.md 的（{rec.tag}）不一致，按 index.md")
+        elif tag and not rec.tag:
+            rec.tag = tag
+        sha = value.get("sha256") or ""
+        if sha:
+            if rec.sha_full and rec.sha_full != sha:
+                rec.warnings.append("账本里的 sha256 自相矛盾（同一个路径出现两个值）")
+            rec.sha_full = sha
+        size = value.get("size")
+        if isinstance(size, int) and not isinstance(size, bool):
+            rec.size = size
+        archive = value.get("archive")
+        if isinstance(archive, dict):
+            rec.archive = archive
+
+    for rec in records.values():
+        if rec.sha_prefix and rec.sha_full and not rec.sha_full.startswith(rec.sha_prefix.lower()):
+            rec.warnings.append(
+                f"index.md 的 sha256 前 8 位（{rec.sha_prefix}）与账本全量 sha256 不一致"
+            )
     return records
 
 
+def _download_asset(args: argparse.Namespace, tag: str, asset_name: str,
+                    target_dir: Path, expected_size: int | None) -> tuple[bool, Path | None, str]:
+    cmd = ["gh", "release", "download", tag, "--repo", args.repo,
+           "--pattern", asset_name, "--dir", str(target_dir), "--clobber"]
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        proc = run(cmd)
+    except ToolError as exc:
+        return False, None, str(exc)
+    path = target_dir / asset_name
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return False, None, detail or f"gh 退出码 {proc.returncode}"
+    if not path.is_file():
+        return False, None, f"gh 说下载成功，但没找到 {path.name}"
+    actual = path.stat().st_size
+    if expected_size is not None and actual != expected_size:
+        return False, None, f"大小不符（远端 {expected_size}，落盘 {actual}）"
+    return True, path, ""
+
+
+def _verify_pulled_pdf(rec: PullRecord, path: Path) -> tuple[bool, str]:
+    if rec.size is not None and path.stat().st_size != rec.size:
+        return False, (f"大小不符（记录 {rec.size}，实际 {path.stat().st_size}）")
+    actual = sha256_file(path)
+    if rec.sha_full:
+        if actual != rec.sha_full.lower():
+            return False, (f"sha256 校验失败（账本 {rec.sha_full[:12]}…，"
+                           f"实际 {actual[:12]}…）")
+    elif rec.sha_prefix:
+        if not actual.startswith(rec.sha_prefix.lower()):
+            return False, (f"sha256 校验失败（index.md 前 8 位 {rec.sha_prefix}，"
+                           f"实际 {actual[:8]}）")
+    else:
+        print("  ⚠️ 记录里没有 sha256，跳过完整性校验")
+    return True, actual
+
+
+def install_downloaded(args: argparse.Namespace, job: PullJob,
+                       downloaded: list[Path]) -> tuple[bool, str]:
+    """把已经下载到临时目录的资产拼/解/校验，落到原路径，最后清理临时目录。"""
+    pdf_name = job.pdf_name
+    tmp = job.tmp
+    key = asset_name_key(pdf_name)
+    tar_key = key + ARCHIVE_SUFFIX
+
+    part_files: list[tuple[int, Path]] = []
+    others: list[Path] = []
+    for path in downloaded:
+        match = re.search(re.escape(tar_key) + r"\.part\.(\d+)$", path.name)
+        if match:
+            part_files.append((int(match.group(1)), path))
+        else:
+            others.append(path)
+    part_files.sort(key=lambda pair: pair[0])
+
+    if part_files:
+        indexes = [idx for idx, _path in part_files]
+        if indexes != list(range(len(indexes))):
+            missing = sorted(set(range(indexes[-1] + 1)) - set(indexes))
+            detail = "分卷缺号"
+            if missing:
+                detail += "：" + ", ".join(f".part.{n:02d}" for n in missing)
+            return False, detail
+        expected_parts = (job.rec.archive or {}).get("parts") or []
+        if expected_parts and len(expected_parts) != len(part_files):
+            return False, (f"分卷数量不一致（账本 {len(expected_parts)} 个，"
+                           f"下载到 {len(part_files)} 个）")
+        archive = tmp / (pdf_name + ARCHIVE_SUFFIX)
+        if archive.exists():
+            archive.unlink()
+        with open(archive, "wb") as out:
+            for _idx, path in part_files:
+                with open(path, "rb") as fh:
+                    shutil.copyfileobj(fh, out, 1024 * 1024)
+        print(f"  已拼接 {len(part_files)} 个分卷：{archive.name}（{human_size_mb(archive.stat().st_size)}）")
+        tar_path = archive
+    else:
+        tar_path = next((p for p in others if p.name == tar_key), None)
+        if tar_path is None:
+            pdf_path = next((p for p in others if p.name == key), None)
+            if pdf_path is None:
+                return False, "临时目录里没有可识别的资产（既没有分卷，也没有 .tar.xz / .pdf）"
+            ok, info = _verify_pulled_pdf(job.rec, pdf_path)
+            if not ok:
+                return False, info
+            job.target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(pdf_path, job.target)
+            shutil.rmtree(tmp, ignore_errors=True)
+            return True, info
+
+    extracted = tmp / pdf_name
+    if extracted.exists():
+        extracted.unlink()
+    proc = run(["tar", "-C", str(tmp), "-xJf", str(tar_path)])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return False, f"tar -xJf 解压失败：{detail or '（没有输出）'}"
+    if not extracted.is_file():
+        return False, f"解压后没有找到 {pdf_name}"
+    ok, info = _verify_pulled_pdf(job.rec, extracted)
+    if not ok:
+        return False, info
+    job.target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(extracted, job.target)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return True, info
+
+
+def run_pull_job(args: argparse.Namespace, job: PullJob) -> tuple[bool, str]:
+    tmp = job.tmp
+    tmp.mkdir(parents=True, exist_ok=True)
+    if job.form == "glob":
+        cmd = ["gh", "release", "download", job.rec.tag, "--repo", args.repo,
+               "--pattern", job.fallback_glob, "--dir", str(tmp), "--clobber"]
+        proc = run(cmd)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()
+            return False, detail or f"gh 退出码 {proc.returncode}"
+        downloaded = [
+            path for path in tmp.iterdir()
+            if path.is_file() and path.name.startswith(job.fallback_glob[:-1])
+        ]
+        if not downloaded:
+            return False, "远端没有匹配到任何资产"
+        return install_downloaded(args, job, downloaded)
+
+    names = list(job.asset_names)
+    sizes = list(job.asset_sizes)
+    if not names:
+        return False, "远端没有可用资产"
+    if len(names) > 1:
+        print(f"  并发下载 {len(names)} 个分卷（--jobs {args.jobs}）")
+        downloaded: list[Path] = []
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=min(args.jobs, len(names))) as pool:
+            futures = {
+                pool.submit(_download_asset, args, job.rec.tag, name, tmp, sizes[i]): name
+                for i, name in enumerate(names)
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    ok, path, why = future.result()
+                except Exception as exc:
+                    ok, path, why = False, None, str(exc)
+                if ok and path is not None:
+                    downloaded.append(path)
+                    with PRINT_LOCK:
+                        print(f"  ✓ {name}（{human_size_mb(path.stat().st_size)}）")
+                else:
+                    errors.append(f"{name}：{why or '下载失败'}")
+                    with PRINT_LOCK:
+                        print(f"  ✗ {name}：{why or '下载失败'}")
+        if errors:
+            return False, f"{len(errors)} 个分卷下载失败"
+        return install_downloaded(args, job, downloaded)
+
+    ok, path, why = _download_asset(args, job.rec.tag, names[0], tmp, sizes[0])
+    if not ok or path is None:
+        return False, why or "下载失败"
+    print(f"  ✓ {names[0]}（{human_size_mb(path.stat().st_size)}）")
+    return install_downloaded(args, job, [path])
+
+
+def print_pull_plan(args: argparse.Namespace, jobs: list[PullJob]) -> None:
+    if not jobs:
+        return
+    print("\n将执行：")
+    for job in jobs:
+        tag = job.rec.tag
+        if job.form == "glob":
+            patterns = [job.fallback_glob]
+        else:
+            patterns = job.asset_names
+        for name in patterns:
+            print(f"  gh release download {tag} --repo {args.repo} --pattern {shq(name)} "
+                  f"--dir {shq(job.tmp)} --clobber")
+        if job.form == "glob":
+            continue
+        if job.form == "parts":
+            parts = " ".join(shq(str(job.tmp / name)) for name in job.asset_names)
+            print(f"  cat {parts} > {shq(job.tmp / (job.pdf_name + ARCHIVE_SUFFIX))}")
+            print(f"  tar -C {shq(job.tmp)} -xJf {shq(job.tmp / (job.pdf_name + ARCHIVE_SUFFIX))}")
+            source = job.tmp / job.pdf_name
+        elif job.form == "single":
+            print(f"  tar -C {shq(job.tmp)} -xJf {shq(job.tmp / job.asset_names[0])}")
+            source = job.tmp / job.pdf_name
+        else:  # 旧形态：下载下来就是一个裸 .pdf
+            source = job.tmp / job.asset_names[0]
+        print(f"  sha256sum {shq(source)}")
+        print(f"  mv {shq(source)} {shq(job.target)}")
+
+
 def do_pull(args: argparse.Namespace, root: Path, scan_root: Path, ledger: dict) -> int:
-    """--pull：下载 cwd 范围内、账本/索引块里有记录但本地不存在的 PDF。"""
+    """--pull：下载 cwd 范围内、index.md / 账本里有记录但本地不存在的 PDF。"""
     records = collect_pull_records(root, scan_root, ledger)
     scope = scope_label(scan_root, root)
     if not records:
-        print(f"\n扫描范围（{scope}）里没有找到任何发布记录（账本和 index.md 托管块都空）。")
+        print(f"\n扫描范围（{scope}）里没有找到任何发布记录（index.md 托管块和账本都空）。")
         return 0
 
     present = [rel for rel in records if (root / rel).is_file()]
@@ -1114,65 +1812,84 @@ def do_pull(args: argparse.Namespace, root: Path, scan_root: Path, ledger: dict)
         return 0
 
     print(f"发现 {len(missing)} 个缺失：")
-    jobs: list[tuple[str, str, Path, list[str] | None, str]] = []
+    jobs: list[PullJob] = []
     remote_missing: list[tuple[str, str, str]] = []
-    pull_warnings: list[tuple[str, str]] = []
+    no_tag: list[tuple[str, str]] = []
     for rel in sorted(missing):
-        info = records[rel]
-        tag = info["tags"][0] if info["tags"] else ""
-        note = ""
-        if len(info["tags"]) > 1:
-            note = f"  ⚠️ 账本/index.md 的 tag 不一致：{' / '.join(info['tags'])}"
-        target_dir = (root / rel).parent
-        # 没核对到远端资产名时，按 GitHub 的归一化规则猜资产名（空格/引号变 '.'）；
-        # 猜对了 --pattern 才能命中，下载后再改回本地文件名。
-        pattern = asset_name_key(Path(rel).name)
-        if tag and not args.no_verify:
-            # 账本说"上传过"不算数：远端真有这个资产才 pull，否则报"远端也没有"。
-            check = check_remote_asset(args.repo, tag, Path(rel).name, info.get("size"))
-            if check.state == "no-release":
-                print(f"  [远端也没有] {rel}  ← {tag}{note}")
-                print("        账本说上传过，但远端没有这个 release，不能 pull。")
-                remote_missing.append((rel, tag, "远端没有这个 release"))
-                continue
-            if check.state in ("no-asset", "draft") and not check.has_asset:
-                print(f"  [远端也没有] {rel}  ← {tag}{note}")
-                print(f"        账本说上传过，但{check.detail}，不能 pull。")
-                remote_missing.append((rel, tag, check.detail))
-                continue
-            if check.state == "draft":
-                pull_warnings.append(
-                    (rel, f"{check.detail}；下载链接对别人不可用，仍尝试下载"))
-            elif check.state == "size-mismatch":
-                pull_warnings.append(
-                    (rel, f"远端资产大小与账本记录不一致（{check.detail}），仍尝试下载"))
-            elif check.state == "error":
-                pull_warnings.append(
-                    (rel, f"远端核对失败，按记录尝试下载（{check.detail or 'gh 没输出原因'}）"))
-            if check.has_asset and check.asset_name:
-                # GitHub 会把资产名里的空格 / 引号换成 '.'，--pattern 要用远端那个名字。
-                pattern = check.asset_name
-        if tag:
-            print(f"  [缺失] {rel}  ← {tag}{note}")
-        else:
-            print(f"  [缺失] {rel}  ← （没有 tag，无法下载）{note}")
-        cmd = None
-        if tag:
-            cmd = ["gh", "release", "download", tag, "--repo", args.repo,
-                   "--pattern", pattern, "--dir", str(target_dir), "--clobber"]
-        jobs.append((rel, tag, target_dir, cmd, pattern))
+        rec = records[rel]
+        for warning in rec.warnings:
+            print(f"  ⚠️ {rel}：{warning}")
+        if not rec.tag:
+            print(f"  [缺失] {rel}  ← （没有 tag，无法下载）")
+            no_tag.append((rel, "index.md 和账本里都没有 release 链接"))
+            continue
+        target = root / rel
+        tmp = tmp_dir_for(target)
+        pdf_name = target.name
+        print(f"  [缺失] {rel}  ← {rec.tag}")
+        if rec.mtime_text:
+            print(f"        mtime：{rec.mtime_text} · sha256：{rec.sha_full[:8] or rec.sha_prefix or '（没记）'}")
 
-    for rel, text in pull_warnings:
-        print(f"  ⚠️ {rel}：{text}")
+        if args.no_verify:
+            # 只信 index.md / 账本：按旧形态先试一把（没有分卷时也能下）。
+            jobs.append(PullJob(rec, target, tmp, pdf_name, "glob",
+                                fallback_glob=asset_name_key(pdf_name) + "*"))
+            continue
+
+        meta = fetch_remote_release(args.repo, rec.tag)
+        if meta.state == "no-release":
+            print(f"  [远端也没有] {rel}  ← {rec.tag}")
+            print("        index.md / 账本说发布过，但远端没有这个 release，不能 pull。")
+            remote_missing.append((rel, rec.tag, "远端没有这个 release"))
+            continue
+        if meta.state == "error":
+            print(f"  ⚠️ 远端核对失败（{meta.detail or 'gh 没输出原因'}），"
+                  f"改按文件名通配下载")
+            jobs.append(PullJob(rec, target, tmp, pdf_name, "glob",
+                                fallback_glob=asset_name_key(pdf_name) + "*"))
+            continue
+        book = classify_book_assets(meta.assets, pdf_name)
+        if book.form == "none":
+            print(f"  [远端也没有] {rel}  ← {rec.tag}")
+            print("        release 里没有这本书的资产（分卷 / tar.xz / 旧版 .pdf 都没有）。")
+            remote_missing.append((rel, rec.tag, "release 里没有这本书的资产"))
+            continue
+        if meta.is_draft:
+            print(f"  ⚠️ {rel}：release 还是草稿（下载链接对别人不可用），仍尝试下载")
+
+        if book.form == "parts":
+            indexes = book.part_indexes
+            if indexes != list(range(len(indexes))):
+                missing_idx = sorted(set(range(indexes[-1] + 1)) - set(indexes)) if indexes else []
+                detail = "分卷不齐"
+                if missing_idx:
+                    detail += "，缺 " + ", ".join(f".part.{n:02d}" for n in missing_idx)
+                print(f"  ✗ {rel}：{detail}（远端资产不完整）")
+                remote_missing.append((rel, rec.tag, detail))
+                continue
+            expected_parts = (rec.archive or {}).get("parts") or []
+            if expected_parts and len(expected_parts) != len(book.parts):
+                detail = (f"分卷数量不一致（账本 {len(expected_parts)} 个，"
+                          f"远端 {len(book.parts)} 个）")
+                print(f"  ✗ {rel}：{detail}")
+                remote_missing.append((rel, rec.tag, detail))
+                continue
+            names = [str(asset.get("name") or "") for asset in book.parts]
+            sizes = [_asset_size(asset) or 0 for asset in book.parts]
+            jobs.append(PullJob(rec, target, tmp, pdf_name, "parts", names, sizes))
+            print(f"        远端 {len(names)} 个分卷，共 "
+                  f"{human_size_mb(sum(sizes))}")
+        elif book.form == "single" and book.single:
+            name = str(book.single.get("name") or "")
+            jobs.append(PullJob(rec, target, tmp, pdf_name, "single",
+                                [name], [_asset_size(book.single) or 0]))
+        elif book.form == "pdf" and book.pdf:
+            name = str(book.pdf.get("name") or "")
+            jobs.append(PullJob(rec, target, tmp, pdf_name, "pdf",
+                                [name], [_asset_size(book.pdf) or 0]))
 
     if args.dry_run:
-        if jobs:
-            print("\n将执行：")
-            for rel, _tag, _target_dir, cmd, _name in jobs:
-                if cmd is None:
-                    print(f"  # {rel}：没有 tag，跳过")
-                else:
-                    print("  " + " ".join(shlex.quote(c) for c in cmd))
+        print_pull_plan(args, jobs)
         if remote_missing:
             print(f"\n其中 {len(remote_missing)} 个远端也没有，不能 pull：")
             for rel, tag, reason in remote_missing:
@@ -1191,59 +1908,34 @@ def do_pull(args: argparse.Namespace, root: Path, scan_root: Path, ledger: dict)
             return 0
 
     print()
-    ok = 0
+    ok_count = 0
     failures: list[tuple[str, str]] = [
         (rel, f"远端也没有：{reason}") for rel, _tag, reason in remote_missing
-    ]
+    ] + [(rel, reason) for rel, reason in no_tag]
     download_failures: list[tuple[str, str]] = []
-    for num, (rel, _tag, target_dir, cmd, download_name) in enumerate(jobs, 1):
-        print(f"[{num}/{len(jobs)}] {rel}")
-        if cmd is None:
-            reason = "记录里没有 tag（账本和 index.md 托管块都没给 release 链接）"
-            print(f"  失败：{reason}")
-            failures.append((rel, reason))
-            download_failures.append((rel, reason))
-            continue
-        print("  $ " + " ".join(shlex.quote(c) for c in cmd))
+    for num, job in enumerate(jobs, 1):
+        print(f"[{num}/{len(jobs)}] {job.rec.rel}")
         try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            proc = run(cmd)
+            ok, info = run_pull_job(args, job)
         except ToolError as exc:
-            print(f"  失败：{exc}")
-            failures.append((rel, str(exc)))
-            download_failures.append((rel, str(exc)))
-            continue
-        target = root / rel
-        downloaded = target_dir / download_name
-        if (proc.returncode == 0 and not target.is_file()
-                and downloaded.is_file() and downloaded != target):
-            # GitHub 的资产名会把空格 / 引号换成 '.'，--dir 下载后是按资产名落盘的；
-            # 这里改回 index.md / 账本里记的本地文件名。
-            try:
-                os.replace(downloaded, target)
-            except OSError as exc:
-                reason = f"下载成功但改名失败：{exc}"
-                print(f"  失败：{reason}")
-                failures.append((rel, reason))
-                download_failures.append((rel, reason))
-                continue
-        if proc.returncode == 0 and target.is_file():
-            print(f"  完成：{rel}（{human_size(target.stat().st_size)}）")
-            ok += 1
+            ok, info = False, str(exc)
+        if ok:
+            print(f"  完成：{job.rec.rel}（{human_size_mb(job.target.stat().st_size)}）"
+                  f" · sha256:{info[:8]}")
+            ok_count += 1
         else:
-            detail = (proc.stderr or proc.stdout).strip() or f"gh 退出码 {proc.returncode}"
-            print(f"  失败：{detail}")
-            failures.append((rel, detail))
-            download_failures.append((rel, detail))
+            print(f"  失败：{info}")
+            failures.append((job.rec.rel, info))
+            download_failures.append((job.rec.rel, info))
 
     print("\n==== 总账（--pull）====")
-    print(f"成功 {ok} / 失败 {len(failures)} / 本来就在本地 {len(present)}")
+    print(f"成功 {ok_count} / 失败 {len(failures)} / 本来就在本地 {len(present)}")
     if remote_missing:
         print(f"\n{len(remote_missing)} 个记录远端也没有资产，不能 pull：")
         for rel, tag, reason in remote_missing:
             print(f"  ✗ {rel}（tag {tag}）：{reason}")
-        print("  账本说上传过，但远端 release 里查不到对应资产；")
-        print("  先在能上传的机器上跑 ./gbb 补传（或把这条从账本里删掉），再 --pull。")
+        print("  index.md 说发布过，但远端 release 里查不到对应资产；")
+        print("  先在能上传的机器上跑 ./gbb 补传（或把这条从 index.md / 账本里删掉），再 --pull。")
     if download_failures:
         for rel, reason in download_failures:
             print(f"  ✗ {rel}：{reason}")
@@ -1254,6 +1946,10 @@ def do_pull(args: argparse.Namespace, root: Path, scan_root: Path, ledger: dict)
     print("\n全部下载完成。index.md 和账本没有改动，也没有提交/推送。")
     return 0
 
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
 
 def _main(args: argparse.Namespace) -> int:
     cwd = Path.cwd()
@@ -1343,6 +2039,7 @@ def _main(args: argparse.Namespace) -> int:
     for pdf, index_dir in sorted(rows, key=lambda row: rel_posix(row[0], root)):
         rel = rel_posix(pdf, root)
         sha = sha256_file(pdf)
+        mtime, mtime_text = mtime_info(pdf)
         size = pdf.stat().st_size
         old = ledger.get(rel) if isinstance(ledger.get(rel), dict) else None
         item = Item(
@@ -1351,48 +2048,72 @@ def _main(args: argparse.Namespace) -> int:
             index_dir=index_dir,
             index_rel=rel_posix(index_dir / "index.md", root),
             sha=sha,
+            mtime=mtime,
+            mtime_text=mtime_text,
             size=size,
             tag="",
             url="",
             kind="",
             old=old,
         )
-        if old and old.get("sha256") == sha and old.get("tag"):
-            # 账本说"上传过"只是线索：默认必须去远端核对，账本不当事实。
-            tag = old["tag"]
-            item.tag = tag
-            item.url = old.get("url") or url_for(args.repo, tag)
-            if args.no_verify:
-                item.kind = "skip"
-                item.verify_label = "--no-verify"
-                last_state = str(old.get("last_remote_state") or "").strip()
-                if last_state != "published":
-                    noverify_warnings.append((item, last_state or "未知（账本里没记）"))
+        if old and old.get("sha256"):
+            old_tag = old.get("tag") or ""
+            old_mtime = old.get("mtime") or ""
+            if old.get("sha256") != sha:
+                item.kind = "changed"
+                item.reason = "sha256 变了"
+            elif old_mtime and old_mtime != mtime:
+                item.kind = "changed"
+                item.reason = "mtime 变了（内容没变）"
+            elif not old_tag:
+                item.kind = "changed"
+                item.reason = "账本里没有 tag"
             else:
-                check = check_remote_asset(args.repo, tag, pdf.name, size)
-                item.is_draft = check.is_draft
-                if check.state == "ok":
+                # 账本说"上传过"只是线索：默认必须去远端核对，账本不当事实。
+                tag = old_tag
+                item.tag = tag
+                item.url = old.get("url") or url_for(args.repo, tag)
+                if args.no_verify:
                     item.kind = "skip"
+                    item.verify_label = "--no-verify"
+                    last_state = str(old.get("last_remote_state") or "").strip()
+                    if last_state != "published":
+                        noverify_warnings.append((item, last_state or "未知（账本里没记）"))
                 else:
-                    item.kind = "reupload"
-                    if check.state == "no-release":
-                        item.reason = "远端没有 release"
-                        item.upload_mode = "create"
-                    elif check.state == "no-asset":
-                        item.reason = "release 里没有这个文件"
-                        item.upload_mode = "upload"
-                    elif check.state == "size-mismatch":
-                        item.reason = "大小不一致"
-                        item.upload_mode = "upload"
-                    elif check.state == "draft":
-                        item.reason = check.detail
-                        item.upload_mode = "upload"
-                    else:  # error：网络 / 权限 / 输出坏了
-                        item.reason = "远端核对失败，按未上传处理"
-                        item.upload_mode = "unknown"
-                        remote_warnings.append((item, check.detail))
+                    check = check_remote_book(args.repo, tag, pdf.name, old)
+                    item.is_draft = check.is_draft
+                    if check.state == "ok":
+                        item.kind = "skip"
+                        debug(f"远端核对通过：{rel}（{check.detail}）")
+                    else:
+                        item.kind = "reupload"
+                        if check.state == "no-release":
+                            item.reason = "远端没有 release"
+                            item.upload_mode = "create"
+                        elif check.state == "no-asset":
+                            item.reason = "release 里没有这个文件"
+                            item.upload_mode = "upload"
+                        elif check.state == "form-changed":
+                            item.reason = check.detail
+                            item.upload_mode = "upload"
+                        elif check.state == "incomplete":
+                            item.reason = check.detail
+                            item.upload_mode = "upload"
+                        elif check.state == "draft":
+                            item.reason = check.detail
+                            item.upload_mode = "upload"
+                        else:  # error：网络 / 权限 / 输出坏了
+                            item.reason = "远端核对失败，按未上传处理"
+                            item.upload_mode = "unknown"
+                            remote_warnings.append((item, check.detail))
+            if item.kind == "changed":
+                item.tag = make_tag(index_dir, pdf, stamp, tags)
+                tags.add(item.tag)
+                item.url = url_for(args.repo, item.tag)
+                item.upload_mode = "create" if args.no_verify else "unknown"
         else:
-            item.kind = "changed" if old and old.get("sha256") else "new"
+            item.kind = "changed" if old else "new"
+            item.reason = "账本里没有 sha256（旧格式）" if old else ""
             item.tag = make_tag(index_dir, pdf, stamp, tags)
             tags.add(item.tag)
             item.url = url_for(args.repo, item.tag)
@@ -1418,10 +2139,10 @@ def _main(args: argparse.Namespace) -> int:
         print()
         print_items(items)
         if any(it.verify_label == "--no-verify" for it in items):
-            print(f"\n全部已是最新：{len(items)} 个 PDF 的 sha256 都没变，"
+            print(f"\n全部已是最新：{len(items)} 个 PDF 的 sha256 与 mtime 都没变，"
                   f"按账本跳过 {skipped} 个（--no-verify，未核对远端）。")
         else:
-            print(f"\n全部已是最新：{len(items)} 个 PDF 的 sha256 都没变，"
+            print(f"\n全部已是最新：{len(items)} 个 PDF 的 sha256 与 mtime 都没变，"
                   f"远端核对通过，跳过 {skipped} 个。")
         print("没有改 index.md，也没有提交或上传。")
         return 0
@@ -1455,53 +2176,11 @@ def _main(args: argparse.Namespace) -> int:
         if new_text != old_text:
             index_changes[index_md] = new_text
 
-    ledger_new = copy.deepcopy(ledger)
-    # 远端核对通过的跳过项：顺手把 size / asset_size / last_remote_state 补进账本，
-    # 以后 --no-verify 离线判断才有数据可用（sha/tag/url/uploaded_at 一律不动）。
-    for item in items:
-        if item.kind != "skip" or item.verify_label == "--no-verify":
-            continue
-        entry = ledger_new.get(item.rel)
-        if not isinstance(entry, dict):
-            continue
-        entry["size"] = item.size
-        entry["asset_size"] = item.size
-        entry["last_remote_state"] = "published"
-    for item in todo:
-        entry = {
-            "sha256": item.sha,
-            "tag": item.tag,
-            "url": item.url,
-            # size = 本地字节数；asset_size = 这次上传/补传后远端资产应有的字节数
-            # （成功即等于 size；失败会整轮回滚）。给以后 --no-verify 离线判断用。
-            "size": item.size,
-            "asset_size": item.size,
-            "last_remote_state": "published",
-            "uploaded_at": now_iso,
-        }
-        old = item.old
-        if old and old.get("sha256") and old.get("sha256") != item.sha:
-            previous = list(old.get("previous") or [])
-            prev_entry = {
-                "sha256": old.get("sha256"),
-                "tag": old.get("tag"),
-                "url": old.get("url"),
-                "uploaded_at": old.get("uploaded_at"),
-            }
-            for key in ("size", "asset_size", "last_remote_state"):
-                if old.get(key) is not None:
-                    prev_entry[key] = old[key]
-            previous.append(prev_entry)
-            entry["previous"] = previous
-        ledger_new[item.rel] = entry
-    new_ledger_raw = ledger_text(ledger_new).encode("utf-8")
-    ledger_changed = new_ledger_raw != ledger_raw_before
-
     print()
-    print_plan(items, todo, root, args, index_changes, ledger_changed)
+    print_plan(items, todo, root, args, index_changes, ledger_changed=bool(todo))
 
     if args.dry_run:
-        print("\n[dry-run] 没有写任何文件，也没有执行 git / gh 写命令。")
+        print("\n[dry-run] 没有写任何文件、没有压缩，也没有执行 git / gh 写命令。")
         return 0
 
     print()
@@ -1513,8 +2192,68 @@ def _main(args: argparse.Namespace) -> int:
         print("已取消，没有改任何文件。")
         return 0
 
+    # 先把压缩/分卷做出来（复用上次失败留下的分卷），再写账本 —— 账本里要记
+    # 分卷名和大小，之后规划阶段的远端核对才能按"名字 + 大小"验完整性。
+    print("\n准备压缩分卷：")
+    try:
+        for item in todo:
+            print(f"  {item.rel}")
+            item.archive_info = prepare_archive(item.pdf, item.sha, item.mtime)
+    except ToolError as exc:
+        print(f"\n错误：{exc}")
+        print("没有写 index.md / 账本，也没有提交或推送。")
+        return 1
+
     originals: dict[Path, bytes | None] = {path: path.read_bytes() for path in index_changes}
     originals[ledger_path] = ledger_raw_before
+
+    ledger_new = copy.deepcopy(ledger)
+    # 远端核对通过的跳过项：顺手把 mtime / size / asset_size / last_remote_state 补进账本，
+    # 以后 --no-verify 离线判断才有数据可用（sha/tag/url/uploaded_at 一律不动）。
+    for item in items:
+        if item.kind != "skip" or item.verify_label == "--no-verify":
+            continue
+        entry = ledger_new.get(item.rel)
+        if not isinstance(entry, dict):
+            continue
+        entry["mtime"] = item.mtime
+        entry["size"] = item.size
+        archive_meta = entry.get("archive")
+        if isinstance(archive_meta, dict) and isinstance(archive_meta.get("parts"), list):
+            total = sum(int(part.get("size") or 0)
+                        for part in archive_meta["parts"] if isinstance(part, dict))
+            entry["asset_size"] = total
+        entry["last_remote_state"] = "published"
+    for item in todo:
+        info = item.archive_info
+        if info is None:
+            raise ToolError(f"内部错误：{item.rel} 没有压缩分卷信息")
+        entry = {
+            "sha256": item.sha,
+            "mtime": item.mtime,
+            "tag": item.tag,
+            "url": item.url,
+            # size = PDF 本地字节数；asset_size = 这次上传/补传后远端资产的总字节数
+            # （成功即等于分卷总大小；失败会整轮回滚）。
+            "size": item.size,
+            "asset_size": info.total_size,
+            "last_remote_state": "published",
+            "uploaded_at": now_iso,
+            "archive": info.as_ledger(),
+        }
+        old = item.old
+        if old and old.get("tag") and old.get("tag") != item.tag:
+            previous = list(old.get("previous") or [])
+            prev_entry = {
+                key: old.get(key)
+                for key in ("sha256", "mtime", "tag", "url", "size", "asset_size",
+                            "last_remote_state", "uploaded_at", "archive")
+                if old.get(key) is not None
+            }
+            previous.append(prev_entry)
+            entry["previous"] = previous
+        ledger_new[item.rel] = entry
+    new_ledger_raw = ledger_text(ledger_new).encode("utf-8")
 
     for path, text in index_changes.items():
         path.write_text(text, encoding="utf-8")
@@ -1553,6 +2292,7 @@ def _main(args: argparse.Namespace) -> int:
         print_gh_troubleshooting(args.repo)
         print("现在回滚本次对 index.md 和账本的改动，避免留下指向空 release 的链接……")
         rollback(root, originals, args.branch, "release 上传失败")
+        print("临时目录保留着：修好后重跑 ./gbb 会复用已经做好的分卷，不重新压缩。")
         return 1
 
     print("\n==== 总账 ====")
@@ -1566,7 +2306,7 @@ def _main(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     global DEBUG
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    DEBUG = args.debug
+    DEBUG = bool(args.verbose or args.debug)
     try:
         return _main(args)
     except ToolError as exc:
