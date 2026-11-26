@@ -27,12 +27,39 @@
     "url": "https://github.com/allinkernel/wblog-books/releases/tag/80386__INTEL-80386-System-Software-Writer-s-Guide-1986__20261126-1217"
   },
   "cpu-体系结构-官方手册/intel体系结构官方手册/8086/INTEL-The_8086_family_user's_manual.pdf": {
-    "asset_size": 52121162,
+    "archive": {
+      "name": "INTEL-The_8086_family_user's_manual.pdf.tar.xz",
+      "parts": [
+        {
+          "name": "INTEL-The_8086_family_user's_manual.pdf.tar.xz.part.00",
+          "size": 10485760
+        },
+        {
+          "name": "INTEL-The_8086_family_user's_manual.pdf.tar.xz.part.01",
+          "size": 10485760
+        },
+        {
+          "name": "INTEL-The_8086_family_user's_manual.pdf.tar.xz.part.02",
+          "size": 10485760
+        },
+        {
+          "name": "INTEL-The_8086_family_user's_manual.pdf.tar.xz.part.03",
+          "size": 10485760
+        },
+        {
+          "name": "INTEL-The_8086_family_user's_manual.pdf.tar.xz.part.04",
+          "size": 1465664
+        }
+      ],
+      "size": 43408704
+    },
+    "asset_size": 43408704,
     "last_remote_state": "published",
+    "mtime": "2026-11-26T10:35:06+08:00",
     "sha256": "7986483b19cc18911d1b6755d041444cb1d11317bee49c417230ddd01f508ad5",
     "size": 52121162,
     "tag": "8086__INTEL-The_8086_family_user-s_manual__20261126-1214",
-    "uploaded_at": "2026-11-26T19:50:21+08:00",
+    "uploaded_at": "2026-11-26T22:54:51+08:00",
     "url": "https://github.com/allinkernel/wblog-books/releases/tag/8086__INTEL-The_8086_family_user-s_manual__20261126-1214"
   },
   "cpu-体系结构-官方手册/intel体系结构官方手册/amd64-intel64/325462-087-sdm-vol-1-2abcd-3abcd-4.pdf": {
