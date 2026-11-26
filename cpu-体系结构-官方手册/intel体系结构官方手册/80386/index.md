@@ -50,6 +50,6 @@
 
 <!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
 # 下载链接
-1. [INTEL 80386 PROGRAMMER'S REFERENCE MANUAL 1986.pdf](https://github.com/allinkernel/wblog-books/releases/tag/80386__INTEL-80386-PROGRAMMER-S-REFERENCE-MANUAL-1986__20261126-1217) · 1.1 MB · sha256:75b4310c
-2. [INTEL 80386 System Software Writer's Guide 1986.pdf](https://github.com/allinkernel/wblog-books/releases/tag/80386__INTEL-80386-System-Software-Writer-s-Guide-1986__20261126-1217) · 11.2 MB · sha256:e16c70ec
+1. [INTEL 80386 PROGRAMMER'S REFERENCE MANUAL 1986.pdf](https://github.com/allinkernel/wblog-books/releases/tag/80386__INTEL-80386-PROGRAMMER-S-REFERENCE-MANUAL-1986__20261126-1217)
+2. [INTEL 80386 System Software Writer's Guide 1986.pdf](https://github.com/allinkernel/wblog-books/releases/tag/80386__INTEL-80386-System-Software-Writer-s-Guide-1986__20261126-1217)
 <!-- books:downloads:end -->
