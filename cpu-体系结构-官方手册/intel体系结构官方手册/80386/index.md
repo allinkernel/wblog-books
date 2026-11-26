@@ -47,3 +47,9 @@
      - **与总线控制器 (如 82380, 82389) 和DMA控制器的接口考虑。**
      - **物理封装信息。**
    - **重要性：** 设计基于80386的主板或嵌入式系统必备。
+
+<!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
+# 下载链接
+1. [INTEL 80386 PROGRAMMER'S REFERENCE MANUAL 1986.pdf](https://github.com/allinkernel/wblog-books/releases/tag/80386__INTEL-80386-PROGRAMMER-S-REFERENCE-MANUAL-1986__20261126-1217)
+2. [INTEL 80386 System Software Writer's Guide 1986.pdf](https://github.com/allinkernel/wblog-books/releases/tag/80386__INTEL-80386-System-Software-Writer-s-Guide-1986__20261126-1217)
+<!-- books:downloads:end -->
