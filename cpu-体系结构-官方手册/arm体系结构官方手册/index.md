@@ -28,3 +28,8 @@
 | **具体CPU优化**     | Optimization Manual | **Cortex-AXX TRM**              |
 | **芯片组/外设规范** | 各芯片组Datasheet   | **AMBA/GIC/SMMU 规范**          |
 | **CPU勘误**         | SDM Volume 3 附录   | **Cortex-AXX TRM 的Errata章节** |
+
+<!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
+# 下载链接
+1. [DDI0487L_b_a-profile_architecture_reference_manual.pdf](https://github.com/allinkernel/wblog-books/releases/tag/arm体系结构官方手册__DDI0487L_b_a-profile_architecture_reference_manual__20261126-1411)
+<!-- books:downloads:end -->

@@ -46,3 +46,8 @@
 - **汇编/指令集参考:** **SDM Volume 2** 是日常查阅必备。Optimization Manual 提供性能数据。
 - **性能优化:** **Intel Optimization Reference Manual** + 特定微架构资料 (PPR, 或 Intel 针对该代的深度优化指南)。
 - **AMD 平台:** **AMD64 Vol 1, 2, 3** + **PPR for target family**。
+
+<!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
+# 下载链接
+1. [325462-087-sdm-vol-1-2abcd-3abcd-4.pdf](https://github.com/allinkernel/wblog-books/releases/tag/amd64-intel64__325462-087-sdm-vol-1-2abcd-3abcd-4__20261126-1411)
+<!-- books:downloads:end -->
