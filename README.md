@@ -102,7 +102,7 @@
 
 ## 以后都用 `github_release_push` 传
 
-新增/更新分卷时，**不要再从本机直传 GitHub**（实测 0.16–0.23 MB/s）。
+新增/更新分卷时，**不要再从本机直传 GitHub**（本机直传只有 0.16–0.23 MB/s）。
 用 wtool 的私有工具
 [`tools/github-release-push`](https://github.com/allinkernel/wtool-github-release-push)：
 
