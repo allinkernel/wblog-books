@@ -47,6 +47,138 @@
     "uploaded_at": "2026-11-27T11:28:58+08:00",
     "url": "https://github.com/allinkernel/wblog-books/releases/tag/arm体系结构官方手册__DDI0487L_b_a-profile_architecture_reference_manual__20261126-1411"
   },
+  "cpu-体系结构-官方手册/intel体系结构官方手册/4004-8008-8080-80286/210498-005_80286_and_80287_Programmers_Reference_Manual_1987.pdf": {
+    "archive": {
+      "name": "210498-005_80286_and_80287_Programmers_Reference_Manual_1987.pdf.tar.xz",
+      "parts": [
+        {
+          "name": "210498-005_80286_and_80287_Programmers_Reference_Manual_1987.pdf.tar.xz.part.00",
+          "size": 10485760
+        },
+        {
+          "name": "210498-005_80286_and_80287_Programmers_Reference_Manual_1987.pdf.tar.xz.part.01",
+          "size": 10485760
+        },
+        {
+          "name": "210498-005_80286_and_80287_Programmers_Reference_Manual_1987.pdf.tar.xz.part.02",
+          "size": 6441624
+        }
+      ],
+      "size": 27413144
+    },
+    "asset_size": 27413144,
+    "last_remote_state": "published",
+    "mtime": "2026-11-27T13:51:34+08:00",
+    "sha256": "ad487ba99b48cd9f61b14c0fe912a04c7cdb4c7c14a18419aa9faf62d8962460",
+    "size": 27939701,
+    "tag": "4004-8008-8080-80286__210498-005_80286_and_80287_Programmers_Reference_Manual_1987__20261127-1429",
+    "uploaded_at": "2026-11-27T14:29:26+08:00",
+    "url": "https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__210498-005_80286_and_80287_Programmers_Reference_Manual_1987__20261127-1429"
+  },
+  "cpu-体系结构-官方手册/intel体系结构官方手册/4004-8008-8080-80286/98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509.pdf": {
+    "archive": {
+      "name": "98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509.pdf.tar.xz",
+      "parts": [
+        {
+          "name": "98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509.pdf.tar.xz.part.00",
+          "size": 10485760
+        },
+        {
+          "name": "98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509.pdf.tar.xz.part.01",
+          "size": 10485760
+        },
+        {
+          "name": "98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509.pdf.tar.xz.part.02",
+          "size": 10485760
+        },
+        {
+          "name": "98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509.pdf.tar.xz.part.03",
+          "size": 4417512
+        }
+      ],
+      "size": 35874792
+    },
+    "asset_size": 35874792,
+    "last_remote_state": "published",
+    "mtime": "2026-11-27T13:50:25+08:00",
+    "sha256": "d5982f96536b1dbecbeff409d2370970638716296dce7b318624d86221597a9e",
+    "size": 43049640,
+    "tag": "4004-8008-8080-80286__98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509__20261127-1429",
+    "uploaded_at": "2026-11-27T14:29:26+08:00",
+    "url": "https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509__20261127-1429"
+  },
+  "cpu-体系结构-官方手册/intel体系结构官方手册/4004-8008-8080-80286/98-153D__MCS-80_Users_Manual_Oct77.pdf": {
+    "archive": {
+      "name": "98-153D__MCS-80_Users_Manual_Oct77.pdf.tar.xz",
+      "parts": [
+        {
+          "name": "98-153D__MCS-80_Users_Manual_Oct77.pdf.tar.xz.part.00",
+          "size": 10485760
+        },
+        {
+          "name": "98-153D__MCS-80_Users_Manual_Oct77.pdf.tar.xz.part.01",
+          "size": 10485760
+        },
+        {
+          "name": "98-153D__MCS-80_Users_Manual_Oct77.pdf.tar.xz.part.02",
+          "size": 10485760
+        },
+        {
+          "name": "98-153D__MCS-80_Users_Manual_Oct77.pdf.tar.xz.part.03",
+          "size": 6591416
+        }
+      ],
+      "size": 38048696
+    },
+    "asset_size": 38048696,
+    "last_remote_state": "published",
+    "mtime": "2026-11-27T13:50:25+08:00",
+    "sha256": "7b4dce9e23502f3567f22bd62fb24c9cda65503f8c6a1d436d40c837a3e3dd51",
+    "size": 38961682,
+    "tag": "4004-8008-8080-80286__98-153D__MCS-80_Users_Manual_Oct77__20261127-1429",
+    "uploaded_at": "2026-11-27T14:29:26+08:00",
+    "url": "https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__98-153D__MCS-80_Users_Manual_Oct77__20261127-1429"
+  },
+  "cpu-体系结构-官方手册/intel体系结构官方手册/4004-8008-8080-80286/MCS-40_Users_Manual_Nov74.pdf": {
+    "archive": {
+      "name": "MCS-40_Users_Manual_Nov74.pdf.tar.xz",
+      "parts": [
+        {
+          "name": "MCS-40_Users_Manual_Nov74.pdf.tar.xz",
+          "size": 7319436
+        }
+      ],
+      "size": 7319436
+    },
+    "asset_size": 7319436,
+    "last_remote_state": "published",
+    "mtime": "2026-11-27T13:49:41+08:00",
+    "sha256": "fe37193f3e0dcba6b176f29a67420d2ca7a0d4f548b6710d5705af0a6e00d63b",
+    "size": 7446669,
+    "tag": "4004-8008-8080-80286__MCS-40_Users_Manual_Nov74__20261127-1429",
+    "uploaded_at": "2026-11-27T14:29:26+08:00",
+    "url": "https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__MCS-40_Users_Manual_Nov74__20261127-1429"
+  },
+  "cpu-体系结构-官方手册/intel体系结构官方手册/4004-8008-8080-80286/MCS-4_Assembly_Language_Programming_Manual_Dec73.pdf": {
+    "archive": {
+      "name": "MCS-4_Assembly_Language_Programming_Manual_Dec73.pdf.tar.xz",
+      "parts": [
+        {
+          "name": "MCS-4_Assembly_Language_Programming_Manual_Dec73.pdf.tar.xz",
+          "size": 4966588
+        }
+      ],
+      "size": 4966588
+    },
+    "asset_size": 4966588,
+    "last_remote_state": "published",
+    "mtime": "2026-11-27T13:49:13+08:00",
+    "sha256": "a3ebc56ce7067f0b9f36a261f3187cc96796b61cfb1105a88fcb780024963b23",
+    "size": 5215098,
+    "tag": "4004-8008-8080-80286__MCS-4_Assembly_Language_Programming_Manual_Dec73__20261127-1429",
+    "uploaded_at": "2026-11-27T14:29:26+08:00",
+    "url": "https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__MCS-4_Assembly_Language_Programming_Manual_Dec73__20261127-1429"
+  },
   "cpu-体系结构-官方手册/intel体系结构官方手册/80386/INTEL 80386 PROGRAMMER'S REFERENCE MANUAL 1986.pdf": {
     "archive": {
       "name": "INTEL 80386 PROGRAMMER'S REFERENCE MANUAL 1986.pdf.tar.xz",
