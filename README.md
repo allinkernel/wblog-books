@@ -16,10 +16,24 @@
 ./gbb --pull              # 按 index.md 下载当前目录范围内本地缺失的 PDF
 ./gbb --pull --dry-run    # 只打印将执行的 gh release download / 解压命令
 ./gbb --yes               # 询问都自动回答"是"
-./gbb --jobs 4            # 分卷并发上传/下载的线程数（默认 4；1 = 单文件进度条）
+./gbb --jobs 4            # 并发数（默认 4）：并行压缩的进程数 / 分卷并发上传下载的线程数
+./gbb --upload-local      # 本机直传 GitHub（慢 10 倍以上；默认走服务器中转，不用它）
 ./gbb --keep-temp         # 上传成功后也保留 .<pdf>.gbb_tar_dir（默认清理）
 ./gbb --no-verify         # 跳过远端核对，只信本地账本（默认会核对）
+./gbb --dry-run --verbose # 除了计划摘要，再打印将要执行的命令
 ```
+
+**正常使用只有一条命令**：`cd` 到书所在的目录，敲 `gbb`。压缩、分卷、上传、
+回读核对、发布草稿它都自己做完。
+
+**gbb 每次都会核对远端**：账本（`.books-releases.json`）里记着"已上传"不算数，
+运行时会用 `gh release view` 确认 release 真在、分卷真在、大小也对得上；
+草稿（上传被打断留下的）同样算没传好。对不上就补传，并沿用原来的 tag。
+只有加 `--no-verify` 才会跳过这一步、只信本地账本。
+
+本机 `gh` 偶尔会连不上 GitHub（`EOF` / 超时）：那几条只读命令会自动重试 3 次
+（间隔 2s、4s），重试成功会打一行 `gh release view 重试后成功（第 3 次）`；
+三次都不行也不会中止，照样继续上传。
 
 **gbb 每次都会核对远端**：账本（`.books-releases.json`）里记着"已上传"不算数，
 运行时会用 `gh release view` 确认 release 真在、分卷真在、大小也对得上；
@@ -52,24 +66,18 @@
 完整 sha256 和 mtime 都在账本里；`index.md` 的托管块里放 sha256 前 8 位和
 `YYYY-MM-DD HH:MM`，够人肉核对。
 
-## 上传：压缩 → 分卷 → 并发
+## 上传：压缩 → 分卷 → 服务器中转
 
-1. **压缩**（保留原文件名，解压后还是 `<pdf>` 这个名字）：
+**正常只要一条命令**：`cd` 到书所在的目录，敲 `gbb`。
 
-   ```sh
-   tar -C <PDF 所在目录> --use-compress-program='xz -6 -T0' -cf <pdf>.tar.xz -- <pdf>
-   ```
+1. **压缩**（保留原文件名，解压后还是 `<pdf>` 这个名字）：`tar --use-compress-program='xz -6 -T<k>'`。
+   一次要压多本时**并行压**（`--jobs`，默认 4）：并发 N 本就把核分成 N 份（`-T<k>`），
+   每本一行 `压缩完成：xx.x MB，用时 y.y 秒`，最后一行汇总
+   `压缩完成：5 本，共 124.0 MB，用时 18.3 秒（并行 4）`；`--jobs 1` 时一本一本压、吃满全核（`-T0`）。
+   不用 `-9`（太慢）。
 
-   xz 用 `-6 -T0`（所有核并行）；`-9` 太慢，不用。
-
-2. **分卷**：`.tar.xz` 超过 10 MiB 就切：
-
-   ```sh
-   split -b 10M -d -a 2 <pdf>.tar.xz <pdf>.tar.xz.part.
-   ```
-
-   得到 `<pdf>.tar.xz.part.00`、`.part.01`…，**每个 ≤ 10 MiB**，每个分卷是 release 里
-   一个独立的资产。
+2. **分卷**：`.tar.xz` 超过 10 MiB 就切成 `.part.00 .part.01 …`，每个 ≤ 10 MiB，
+   每个分卷是 release 里一个独立资产。
 
 3. **临时目录**：都在 PDF 同目录下的隐藏目录里：
 
@@ -86,38 +94,40 @@
      对得上就直接**复用已有分卷，不重复压缩**；
    - `--keep-temp` 可以强制保留（想手动看看压缩包时用）。
 
-4. **并发上传**：`--jobs N`（默认 4）个线程同时传分卷。
-   - 并发时**不画单文件进度条**（会打架），改画一行汇总，每 2 秒刷新：
+4. **上传**：默认交给 `github_release_push` —— 它先把分卷 `scp` 到一台服务器，
+   再由服务器 `gh release upload` 传 GitHub。**本机不直连 GitHub**，所以家里上行慢、
+   本机网络偶尔抖都不影响上传，也不需要任何代理环境变量。
+   `--jobs N`（默认 4）时同时跑 N 个 `github_release_push` 进程（每个进程自己 scp+ssh）。
+   - 每个分卷成功一行：`✓ <分卷名>（xx.x MB）`；
+   - 并发时另有一行汇总，每 2 秒刷新：
 
      ```
      已完成 3/11 个分卷 · 已传 31.5 MB / 101.6 MB · 1.2 MB/s
      ```
 
      输出不是终端时（重定向到文件 / 管道）每 10 秒打印一行。
-   - `--jobs 1` 且是在终端里跑 → 每个分卷一条 curl 的真实进度条。
+   - `--jobs 1` 且是在终端里跑 → 直接显示 `github_release_push` 自己的 scp 进度条。
    - 进度**只统计已经传完的分卷**（个数和字节），不会编造"正在传多少"。
 
-5. 传完再 `gh release edit --draft=false` 把草稿发布出去，并回读远端核对
-   每个分卷的名字和大小。
+5. 传完 `gh release edit --draft=false` 发布草稿，再**回读远端**核对每个分卷的名字和大小。
+   回读核对由 `gbb` 自己做（不依赖 `github_release_push`）。
 
-## 以后都用 `github_release_push` 传
+**`--upload-local`（不推荐）**：改成本机直传 GitHub（`curl -T`，失败退 `gh release upload --clobber`）。
+只有没配服务器、或想验证本机到 GitHub 的连通性时才用；本机直传实测只有 0.16–0.23 MB/s。
 
-新增/更新分卷时，**不要再从本机直传 GitHub**（本机直传只有 0.16–0.23 MB/s）。
-用 wtool 的私有工具
-[`tools/github-release-push`](https://github.com/allinkernel/wtool-github-release-push)：
+## `github_release_push`：`gbb` 会自动调用
+
+`gbb` 先在 `PATH` 上找 `github_release_push`，找不到就用
+`~/self/wtool/tools/github-release-push/bin/github_release_push`；两处都没有就**明确报错**
+（不会偷偷退回本机直传）。装一次：
 
 ```sh
-github_release_push <分卷文件> <release-URL>
-
-# 例：这本 PDF 的所有分卷
-for f in ".我的书.pdf.gbb_tar_dir/"*.part.*; do
-  github_release_push "$f" \
-    "https://github.com/allinkernel/wblog-books/releases/tag/<tag>"
-done
+wtool install tools/github-release-push
+github_release_push --setup     # 服务器 IP / 登录用户 / 私钥 / 远端临时目录
+github_release_push --check     # 三项体检：连通性 / gh / gh auth status，全 ✓ 才行
 ```
 
-同名资产会被覆盖；传完会回读远端核对大小（有 sha256 时一起核）。
-装法、首次配置（服务器 + `gh` + 公钥）见那个仓的 `README.md` / `wtool-doc`。
+服务器上要装 `gh` 并登录、本机公钥要配到服务器 —— 细节看 `github_release_push --help`。
 
 ## 下载缺失的 PDF（`--pull`）
 
@@ -153,51 +163,58 @@ done
 ```
 == books/gbb ==
 仓库根：/home/mindul/self/wblog/books
+扫描范围：80386（当前目录）
 远端仓库：allinkernel/wblog-books    分支：main
+
 扫描到 2 个 PDF：
-  [需补传：资产形态变了（旧版是单个 .pdf，现在传 .tar.xz / 分卷）] 80386/INTEL 80386 ....pdf
-         归属：80386/index.md
-         tag ：80386__INTEL-80386-...__20261126-1217（补传继续用这个旧 tag，不新建）
-         mtime：2026-11-26 10:35 · sha256:75b4310c
-  [跳过] 8086/INTEL-The_8086_family_user's_manual.pdf
-         归属：8086/index.md
-         tag ：8086__INTEL-The_8086_family_user-s_manual__20261126-1214
-         mtime：2026-11-26 10:35 · sha256:7986483b
+  [跳过] 80386/INTEL 80386 PROGRAMMER'S REFERENCE MANUAL 1986.pdf · 1.1 MB · tag 80386__INTEL-80386-PROGRAMMER-S-REFERENCE-MANUAL-1986__20261126-1217
+  [需补传：release 是草稿（未发布）] 80386/INTEL 80386 System Software Writer's Guide 1986.pdf · 11.2 MB · tag 80386__INTEL-80386-System-Software-Writer-s-Guide-1986__20261126-1217（沿用旧 tag，不新建）
 
 计划写入：
   - 80386/index.md（更新「下载链接」托管块）
   - .books-releases.json（记录 1 条发布账）
 
-将执行：
-  git -C .../books add -- ...
-  git -C .../books commit -F <提交信息> -- ...
-  git -C .../books push origin main
-  [80386/INTEL 80386 ....pdf]
-  tar -C .../80386 --use-compress-program='xz -6 -T0' -cf .../.INTEL ....pdf.gbb_tar_dir/... -- ...
-  split -b 10M -d -a 2 .../.INTEL ....pdf.gbb_tar_dir/... ...
-  gh release view 80386__... --repo allinkernel/wblog-books --json databaseId,isDraft
-  curl -T <分卷> -X POST -H 'Content-Type: application/octet-stream' -K - --fail 'https://uploads.github.com/...'
-  gh release edit 80386__... --repo allinkernel/wblog-books --draft=false
 确认按上面的计划修改 index.md、提交并推送到 main？（共 1 个 PDF） [y/N] y
 
 准备压缩分卷：
-  80386/INTEL 80386 ....pdf
-  压缩：INTEL 80386 ....pdf → .INTEL ....pdf.gbb_tar_dir/INTEL ....pdf.tar.xz
-  压缩完成：1.0 MB，用时 0.2 秒
-  待上传 1 个资产，共 1.0 MB
+  [INTEL 80386 System Software Writer's Guide 1986.pdf] 压缩：INTEL 80386 ...pdf
+  [INTEL 80386 System Software Writer's Guide 1986.pdf] 压缩完成：10.7 MB，用时 3.1 秒
+  [INTEL 80386 System Software Writer's Guide 1986.pdf] 分卷：2 个（每个 ≤ 10 MiB）
+  [INTEL 80386 System Software Writer's Guide 1986.pdf] 待上传 2 个资产，共 10.7 MB
 已写入 80386/index.md
 已写入 .books-releases.json
 已提交：abc1234
 已推送 origin/main
 
-现在把这 1 个 release 上传到 allinkernel/wblog-books？ [Y/n] y
-[1/1] 80386/INTEL 80386 ....pdf
-  上传 1 个资产，共 1.0 MB（PDF 1.0 MB）
+现在把这 1 个 release 上传到 allinkernel/wblog-books？（上传后 index.md 里的链接才可用） [Y/n] y
+
+[1/1] 80386/INTEL 80386 System Software Writer's Guide 1986.pdf
+  上传 2 个资产，共 10.7 MB（PDF 11.2 MB）
   建 release（--draft，不带资产）
-  已完成 1/1 个分卷 · 已传 1.0 MB / 1.0 MB · 3.2 MB/s
+  已完成 1/2 个分卷 · 已传 5.2 MB / 10.7 MB · 2.1 MB/s
+  已完成 2/2 个分卷 · 已传 10.7 MB / 10.7 MB · 2.3 MB/s
+  ✓ INTEL.80386.System.Software.Writer.s.Guide.1986.pdf.tar.xz.part.00（10.0 MB）
+  ✓ INTEL.80386.System.Software.Writer.s.Guide.1986.pdf.tar.xz.part.01（680.0 KB）
+  release 是草稿，上传完成后发布：gh release edit --draft=false
   草稿已发布，下载链接现在可用了。
-  已清理临时目录：.INTEL ....pdf.gbb_tar_dir
+  已清理临时目录：.INTEL 80386 System Software Writer's Guide 1986.pdf.gbb_tar_dir
   完成：https://github.com/allinkernel/wblog-books/releases/tag/80386__...
+
+==== 总账 ====
+成功 1 / 跳过 1 / 失败 0
+  ✓ 80386/INTEL 80386 System Software Writer's Guide 1986.pdf
+    https://github.com/allinkernel/wblog-books/releases/tag/80386__...
+
+完成。
+```
+
+一次压多本时，压缩那几行会交错出现（每行带 `[文件名]` 前缀），最后一行是汇总
+`压缩完成：5 本，共 124.0 MB，用时 18.3 秒（并行 4）`。
+
+`--dry-run` 只打印计划摘要（每本一行），**不打印命令**；想看命令加 `--verbose`：
+
+```sh
+./gbb --dry-run --verbose
 ```
 
 ## `index.md` 里长什么样

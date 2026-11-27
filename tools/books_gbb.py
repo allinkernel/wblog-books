@@ -20,10 +20,17 @@
   * 临时目录 = PDF 同目录下的隐藏目录 `.<pdf>.gbb_tar_dir`
     （放 .tar.xz、分卷和 `.gbb-archive.json`）。上传成功清理，`--keep-temp` 保留；
     失败保留，下次运行校验 manifest 后复用已有分卷、不重复压缩；
-  * 分卷并发上传（`--jobs`，默认 4）：并发时**不画单文件进度条**，每 2 秒刷一行
-    "已完成 x/N 个分卷 · 已传 … / … · …/s"（非 TTY 每 10 秒一行）；
-    `--jobs 1` 且是终端时用 curl 的单文件真实进度条。进度只来自"已完成分卷"，
-    绝不编造；
+  * 分卷上传默认交给 `github_release_push`（wtool 的私有工具）：先把分卷 scp 到一台
+    服务器，再由服务器 `gh release upload` 传 GitHub。本机不直连 GitHub，所以家里
+    上行慢 / 网络抖动都不拖累上传，也**不需要任何代理环境变量**；
+    `--jobs` 起线程池并发调多个 `github_release_push`（每个进程自己 scp+ssh）；
+    并发时**不画单文件进度条**，每 2 秒刷一行"已完成 x/N 个分卷 · 已传 … / … · …/s"
+    （非 TTY 每 10 秒一行），每个分卷成功留一行 `✓ <分卷名>（大小）`；
+    `--jobs 1` 且是终端时**转发** `github_release_push` 自己的 scp 进度条；
+  * `--upload-local` 才走旧的本机直传（`curl -T` 优先、失败退
+    `gh release upload --clobber`）—— 那条路慢 10 倍以上，默认不用；
+  * 本机 `gh` 偶发 EOF（Clash 把 api.github.com 解析成假 IP）：所有只读的
+    `gh release view` 与 `gh release edit` 都走 `_gh_retry`（3 次，间隔 2s / 4s）；
   * 账本 ../.books-releases.json 记
     {PDF 相对路径: {sha256, mtime, tag, url, size, asset_size, last_remote_state,
                    uploaded_at, archive:{name,size,parts:[{name,size}]}}}；
@@ -79,6 +86,14 @@ TEMP_DIR_SUFFIX = ".gbb_tar_dir"
 MANIFEST_NAME = ".gbb-archive.json"
 CONTENT_TYPE = "application/octet-stream"
 DEFAULT_JOBS = 4
+# 默认上传通道：`github_release_push`（wtool 的私有工具，先 scp 到服务器再 gh release
+# upload）。先在 PATH 上找；找不到再用仓库里的那份（不装也能用）。
+GRP_NAME = "github_release_push"
+GRP_FALLBACK = "~/self/wtool/tools/github-release-push/bin/github_release_push"
+# `gh` 只读调用的重试：2026-11-27 实测 Clash TUN 把 api.github.com 解析成 198.18.0.76
+# 假 IP，`gh api` / `gh release view` 偶发 EOF（不是凭证问题）。3 次，间隔 2s / 4s。
+GH_TRIES = 3
+GH_RETRY_DELAYS = (2.0, 4.0)
 # `gh release view` 对"release 不存在"的说法：stderr 一行 `release not found`，
 # 或者 HTTP 404。别把网络 / 权限错误也当成"没有 release"，那是两回事。
 NOT_FOUND_RE = re.compile(r"(?:\b404\b|not found)", re.IGNORECASE)
@@ -144,6 +159,75 @@ def run(cmd: list, cwd: Path | None = None, check: bool = False) -> subprocess.C
 
 def rel_posix(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def find_github_release_push() -> str | None:
+    """找 `github_release_push` 可执行文件：先 PATH，再 wtool 项目里的 `bin/`。
+
+    找不到返回 None —— 调用方必须**明确报错**，不许静默退回本机直传
+    （2026-11-27 用户要求：敲 `gbb` 就该能上传，慢的那条路不能再被偷偷选中）。
+    """
+    found = shutil.which(GRP_NAME)
+    if found:
+        return found
+    fallback = Path(os.path.expanduser(GRP_FALLBACK))
+    if fallback.is_file() and os.access(fallback, os.X_OK):
+        return str(fallback)
+    return None
+
+
+def grp_missing_message() -> str:
+    return (
+        f"找不到 {GRP_NAME}（默认上传通道：先 scp 到服务器、再由服务器传 GitHub）。\n"
+        f"\n"
+        f"  装一次就能用（装完命令在 PATH 上）：\n"
+        f"    wtool install tools/github-release-push\n"
+        f"  或者不装、直接用工作区里的那份（本脚本会自动找这个路径）：\n"
+        f"    {os.path.expanduser(GRP_FALLBACK)}\n"
+        f"\n"
+        f"  首次准备只需一次：{GRP_NAME} --setup 然后 {GRP_NAME} --check\n"
+        f"  （服务器装 gh、本机公钥配到服务器等细节在它的 --help 里）\n"
+        f"\n"
+        f"  确实想在本机直传（慢 10 倍以上、而且本机要直连 GitHub）：gbb --upload-local"
+    )
+
+
+def _gh_retry(cmd: list, tries: int = GH_TRIES,
+              delays: tuple[float, ...] = GH_RETRY_DELAYS,
+              label: str = "") -> tuple[subprocess.CompletedProcess, int]:
+    """跑一条 `gh` 命令，失败就退避重试（默认 3 次，间隔 2s / 4s）。
+
+    返回 (最后一次的 CompletedProcess, 实际尝试次数)。`gh` 明确说 not found / 404
+    时**不重试**（那不是网络抖动，重试只是白等 6 秒）。
+    重试过并且最后成功时打一行提示，让人知道刚才抖了一下。
+    """
+    proc: subprocess.CompletedProcess | None = None
+    attempt = 0
+    for attempt in range(1, tries + 1):
+        proc = run(cmd)
+        if proc.returncode == 0:
+            if attempt > 1:
+                with PRINT_LOCK:
+                    print(f"  gh {label} 重试后成功（第 {attempt} 次）", flush=True)
+            return proc, attempt
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if label.startswith("release view") and NOT_FOUND_RE.search(detail):
+            return proc, attempt
+        if attempt < tries:
+            delay = delays[min(attempt - 1, len(delays) - 1)]
+            debug(f"gh {label} 失败（第 {attempt}/{tries} 次），{delay:.0f}s 后重试：{detail[:200]}")
+            time.sleep(delay)
+    assert proc is not None
+    return proc, attempt
+
+
+def tail_lines(text: str, count: int = 5, width: int = 300) -> str:
+    """取一段输出的最后几行（喂给报错摘要用）。"""
+    lines = [line.rstrip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    out = "\n".join(lines[-count:])
+    return out[-width:] if len(out) > width else out
 
 
 def human_size(num: int) -> str:
@@ -429,14 +513,41 @@ def write_archive_manifest(info: ArchiveInfo, pdf: Path, sha: str, mtime: str) -
     )
 
 
-def prepare_archive(pdf: Path, sha: str, mtime: str) -> ArchiveInfo:
-    """把 PDF 压成 <pdf>.tar.xz（xz -6 -T0），超过 10 MiB 再分卷；能复用就复用。"""
+def xz_program(threads: int) -> str:
+    """xz 的程序串。threads<=0 → `-T0`（吃满全核）；否则 `-T<threads>`。
+
+    并行压多本时必须按并发数分核：N 个 `xz -T0` 会互相抢核，反而比串行还慢。
+    """
+    return f"xz -6 -T{threads}" if threads > 0 else XZ_PROGRAM
+
+
+def _xz_threads(jobs_actual: int) -> int:
+    """每个 xz 分几个线程：并发 N 个就把核分成 N 份；只压 1 本就吃满全核（-T0）。"""
+    if jobs_actual <= 1:
+        return 0
+    cpu = os.cpu_count() or 1
+    return max(1, cpu // jobs_actual)
+
+
+def _say(message: str) -> None:
+    """线程里也要整行打印：先拼好整句，再一把写出去（并行压缩时别把两行搅在一起）。"""
+    with PRINT_LOCK:
+        print(message, flush=True)
+
+
+def prepare_archive(pdf: Path, sha: str, mtime: str, xz_threads: int = 0,
+                    label: str = "") -> ArchiveInfo:
+    """把 PDF 压成 <pdf>.tar.xz，超过 10 MiB 再分卷；能复用就复用。
+
+    `xz_threads`：0 = `-T0`（吃满全核）；并行压多本时传 `-T<k>`（见 `_xz_threads`）。
+    `label`：并行时给每行加个 `[文件名] ` 前缀，交错输出也能认出来是哪本。
+    """
     tmp = tmp_dir_for(pdf)
     reused = load_archive_manifest(tmp, pdf, sha, mtime)
     if reused is not None:
         names = " / ".join(part.name for part in reused.parts[:3])
         more = "" if len(reused.parts) <= 3 else f" …（共 {len(reused.parts)} 个）"
-        print(f"  复用上次留下的分卷（sha256 与 mtime 都没变，不重新压缩）：{names}{more}")
+        _say(f"  {label}复用上次留下的分卷（sha256 与 mtime 都没变，不重新压缩）：{names}{more}")
         return reused
 
     if tmp.exists():
@@ -447,11 +558,12 @@ def prepare_archive(pdf: Path, sha: str, mtime: str) -> ArchiveInfo:
     archive_name = archive_name_for(pdf)
     archive = tmp / archive_name
 
-    print(f"  压缩：{pdf.name} → .{pdf.name}{TEMP_DIR_SUFFIX}/{archive_name}")
+    program = xz_program(xz_threads)
+    _say(f"  {label}压缩：{pdf.name}")
     started = time.monotonic()
     tar_cmd = [
         "tar", "-C", str(pdf.parent),
-        f"--use-compress-program={XZ_PROGRAM}",
+        f"--use-compress-program={program}",
         "-cf", str(archive), "--", pdf.name,
     ]
     proc = run(tar_cmd)
@@ -459,11 +571,12 @@ def prepare_archive(pdf: Path, sha: str, mtime: str) -> ArchiveInfo:
         shutil.rmtree(tmp, ignore_errors=True)
         detail = (proc.stderr or proc.stdout).strip()
         raise ToolError(
-            f"tar / xz 压缩失败（{XZ_PROGRAM}）：\n{detail or '（没有输出）'}\n"
-            "  确认本机有 tar 与 xz（xz 要支持 -T0 多线程）。"
+            f"tar / xz 压缩失败（{program}）：\n{detail or '（没有输出）'}\n"
+            "  确认本机有 tar 与 xz（xz 要支持 -T 多线程）。"
         )
     archive_size = archive.stat().st_size
-    print(f"  压缩完成：{human_size_mb(archive_size)}，用时 {elapsed_text(time.monotonic() - started)}")
+    _say(f"  {label}压缩完成：{human_size_mb(archive_size)}，"
+         f"用时 {elapsed_text(time.monotonic() - started)}")
 
     part_paths: list[Path] = [archive]
     if archive_size > PART_BYTES:
@@ -483,7 +596,7 @@ def prepare_archive(pdf: Path, sha: str, mtime: str) -> ArchiveInfo:
         if len(part_paths) < 2:
             shutil.rmtree(tmp, ignore_errors=True)
             raise ToolError("产物超过 10 MiB，但 split 之后没有拿到多个分卷")
-        print(f"  分卷：{len(part_paths)} 个（每个 ≤ 10 MiB）")
+        _say(f"  {label}分卷：{len(part_paths)} 个（每个 ≤ 10 MiB）")
 
     parts = [ArchivePart(path, path.name, path.stat().st_size) for path in part_paths]
     for part in parts:
@@ -493,8 +606,49 @@ def prepare_archive(pdf: Path, sha: str, mtime: str) -> ArchiveInfo:
     info = ArchiveInfo(tmp, archive, archive_name, parts)
     write_archive_manifest(info, pdf, sha, mtime)
     total = human_size_mb(info.total_size)
-    print(f"  待上传 {len(parts)} 个资产，共 {total}")
+    _say(f"  {label}待上传 {len(parts)} 个资产，共 {total}")
     return info
+
+
+def prepare_archives(args: argparse.Namespace, todo: list[Item]) -> list[ArchiveInfo]:
+    """并行压缩本轮要传的多个 PDF（`--jobs` 既控并发，也用来分 xz 的线程数）。
+
+    任一本失败 → 抛 ToolError（带上哪一本），其余任务取消；调用方不会带着半成品继续。
+    """
+    if not todo:
+        return []
+    jobs_actual = max(1, min(args.jobs, len(todo)))
+    threads = _xz_threads(jobs_actual)
+    if len(todo) == 1:
+        item = todo[0]
+        _say(f"  {item.rel}")
+        return [prepare_archive(item.pdf, item.sha, item.mtime, threads)]
+
+    label = "" if jobs_actual == 1 else f"[{{name}}] "
+    if jobs_actual == 1:
+        _say(f"  串行压缩 {len(todo)} 本（--jobs 1，每本 {xz_program(threads)}）")
+    else:
+        _say(f"  并行压缩 {len(todo)} 本（--jobs {jobs_actual}，每本 {xz_program(threads)}）")
+    results: dict[str, ArchiveInfo] = {}
+    errors: list[tuple[Item, str]] = []
+    with ThreadPoolExecutor(max_workers=jobs_actual) as pool:
+        futures = {
+            pool.submit(prepare_archive, item.pdf, item.sha, item.mtime, threads,
+                        label.format(name=item.pdf.name)): item
+            for item in todo
+        }
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                results[item.rel] = future.result()
+            except Exception as exc:  # 单本失败别拖死其他线程，但整轮要中止
+                errors.append((item, str(exc)))
+                for other in futures:
+                    other.cancel()
+    if errors:
+        item, detail = errors[0]
+        raise ToolError(f"{item.rel} 压缩失败：\n{detail}")
+    return [results[item.rel] for item in todo]
 
 
 def cleanup_temp(info: ArchiveInfo, keep: bool) -> None:
@@ -556,8 +710,9 @@ def fetch_remote_release(repo: str, tag: str) -> RemoteRelease:
       * error      —— 网络 / 权限 / 输出坏了：调用方必须按"未上传"处理，不能静默跳过。
     """
     try:
-        proc = run(["gh", "release", "view", tag, "--repo", repo,
-                    "--json", "tagName,assets,isDraft"])
+        proc, _tries = _gh_retry(["gh", "release", "view", tag, "--repo", repo,
+                                  "--json", "tagName,assets,isDraft"],
+                                 label="release view")
     except ToolError as exc:
         return RemoteRelease("error", str(exc))
     if proc.returncode != 0:
@@ -858,8 +1013,24 @@ def print_gh_troubleshooting(repo: str, action: str = "上传") -> None:
   2) token 权限必须包含 repo（{action} release 必需）
      只读 token 的典型报错：HTTP 403: Resource not accessible by personal access token
      重新授权带上 scope：gh auth login -h github.com -s repo
-  3) 网络 / 代理：确认能访问 https://api.github.com 和 https://uploads.github.com
+  3) 网络：确认能访问 https://api.github.com 和 https://uploads.github.com
   4) 仓库和权限：确认 {repo} 已创建，且当前账号对它至少有写权限
+  5) 分卷都是 10 MiB，不会碰到 GitHub 单个资产 2GB 的上限
+""")
+
+
+def print_push_troubleshooting() -> None:
+    exe = find_github_release_push() or GRP_NAME
+    print(f"""
+上传这一步失败了（走的是 {GRP_NAME}：先 scp 到服务器，再由服务器传 GitHub）。
+本机不直连 GitHub，所以本机的网络抖动基本不会影响上传；按下面顺序查：
+
+  1) 一条命令体检：{exe} --check
+     （服务器连通性 / 服务器上的 gh / 服务器上的 gh auth status，三项都要 ✓）
+  2) 还没配过服务器：{exe} --setup
+     首次准备（服务器装 gh、本机公钥配到服务器）看它自己的 --help
+  3) 想先看它会跑什么、不动远端：{exe} <文件> --repo {DEFAULT_REPO} --tag <tag> --dry-run
+  4) scp 就失败：ssh -o BatchMode=yes -i <私钥> <用户>@<主机> 'echo ok' 必须输出 ok
   5) 分卷都是 10 MiB，不会碰到 GitHub 单个资产 2GB 的上限
 """)
 
@@ -892,8 +1063,18 @@ def stage_paths(root: Path, paths: list[Path]) -> None:
             run(["git", "-C", root, "rm", "-f", "--ignore-unmatch", "--", rel], check=False)
 
 
-def git_commit(root: Path, paths: list[Path], message: str) -> str:
+def git_commit(root: Path, paths: list[Path], message: str) -> str | None:
+    """提交这几个路径。**没有任何实际改动时返回 None**（不是错误）。
+
+    什么时候会没有改动：账本里唯一会变的是 `uploaded_at`（精确到秒），
+    同一秒内重跑一次就一模一样了。`git commit` 对空提交会返回非 0，
+    旧版会把这种情况当"提交失败"整轮中止 —— 明明什么都对，只是没什么可提交。
+    """
     rels = [rel_posix(p, root) for p in paths]
+    if run(["git", "-C", root, "diff", "--cached", "--quiet", "--", *rels]).returncode == 0:
+        debug(f"这几条路径没有实际改动，跳过 git commit：{rels}")
+        head = run(["git", "-C", root, "rev-parse", "--short", "HEAD"])
+        return None
     fd, msg_path = tempfile.mkstemp(prefix="books-gbb-msg-", suffix=".txt")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -946,7 +1127,10 @@ def rollback(root: Path, originals: dict[Path, bytes | None], branch: str, reaso
         "下次运行 books/gbb 会重新生成计划。\n"
     )
     commit = git_commit(root, paths, message)
-    print(f"已回滚并提交：{commit}")
+    if commit:
+        print(f"已回滚并提交：{commit}")
+    else:
+        print("（没有需要回滚的已提交改动）")
     if not git_push(root, branch):
         print("⚠️ 回滚提交没能推送，请手动 git push。")
 
@@ -976,6 +1160,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS,
                         help=f"并发上传/下载的分卷数（默认 {DEFAULT_JOBS}；"
                              f"1 = 单个分卷一条真实进度条）")
+    parser.add_argument("--upload-local", action="store_true",
+                        help=f"本机直传（慢 10 倍以上）；默认走 {GRP_NAME} 经服务器中转，"
+                             f"本机不碰 GitHub 的网络")
     parser.add_argument("--keep-temp", action="store_true",
                         help="上传成功后保留 .<pdf>.gbb_tar_dir（默认清理；失败时总会保留）")
     parser.add_argument("--repo", default=DEFAULT_REPO,
@@ -1007,18 +1194,41 @@ def item_status_text(item: Item) -> str:
     return "跳过"
 
 
-def print_items(items: list[Item]) -> None:
+def dry_run_archive_hint(item: Item) -> str:
+    """dry-run 时能确定的分卷情况：临时目录里有能复用的 manifest 才说"已有"。
+
+    还没压缩过就说"待压缩" —— 不按 PDF 大小猜卷数，猜出来的数字就是假的。
+    """
+    if item.kind == "skip":
+        return ""
+    tmp = tmp_dir_for(item.pdf)
+    info = load_archive_manifest(tmp, item.pdf, item.sha, item.mtime)
+    if info is not None:
+        return f"已压好 {len(info.parts)} 卷共 {human_size_mb(info.total_size)}（会复用）"
+    if tmp.is_dir():
+        return "临时目录在，但 sha256 / mtime 变了，会重压"
+    return "待压缩"
+
+
+def print_items(items: list[Item], verbose: bool = False,
+                dry_run: bool = False) -> None:
+    """每本书一行：状态 + 大小 + tag。细节（归属 / mtime / sha256 / 旧 tag）看 --verbose。"""
     print(f"扫描到 {len(items)} 个 PDF：")
     for item in items:
-        print(f"  [{item_status_text(item)}] {item.rel}")
-        print(f"         归属：{item.index_rel}")
+        line = (f"  [{item_status_text(item)}] {item.rel} · "
+                f"{human_size_mb(item.size)} · tag {item.tag}")
         if item.kind == "reupload":
-            print(f"         tag ：{item.tag}（补传继续用这个旧 tag，不新建）")
-        else:
-            print(f"         tag ：{item.tag}")
-        print(f"         mtime：{item.mtime_text} · sha256:{item.sha[:8]}")
-        if item.kind == "changed" and item.old and item.old.get("tag"):
-            print(f"         旧 tag：{item.old['tag']}（保留在 GitHub 上，不删）")
+            line += "（沿用旧 tag，不新建）"
+        if dry_run:
+            hint = dry_run_archive_hint(item)
+            if hint:
+                line += f" · {hint}"
+        print(line)
+        if verbose:
+            print(f"       归属：{item.index_rel}")
+            print(f"       mtime：{item.mtime_text} · sha256:{item.sha[:8]}")
+            if item.kind == "changed" and item.old and item.old.get("tag"):
+                print(f"       旧 tag：{item.old['tag']}（保留在 GitHub 上，不删）")
 
 
 def shq(value: object) -> str:
@@ -1026,31 +1236,31 @@ def shq(value: object) -> str:
 
 
 def print_upload_plan(item: Item, args: argparse.Namespace) -> None:
-    """上传这一步会执行的关键命令（dry-run 只打印，不压缩、不跑 curl）。"""
+    """上传这一步的关键命令清单（只有 --verbose 才打到终端）。"""
     tmp = tmp_dir_for(item.pdf)
     archive = tmp / archive_name_for(item.pdf)
     print(f"  [{item.rel}]")
-    print(f"  tar -C {shq(item.pdf.parent)} --use-compress-program={shq(XZ_PROGRAM)} "
+    print(f"  tar -C {shq(item.pdf.parent)} "
+          f"--use-compress-program={shq(xz_program(_xz_threads(args.jobs)))} "
           f"-cf {shq(archive)} -- {shq(item.pdf.name)}")
-    print(f"  split -b {SPLIT_SIZE_ARG} -d -a 2 {shq(archive)} {shq(str(archive) + '.part.')}"
-          f"  （产物 > 10 MiB 时）")
-    if item.upload_mode == "create":
+    print(f"  split -b {SPLIT_SIZE_ARG} -d -a 2 {shq(archive)} {shq(str(archive) + '.part.')}")
+    if item.upload_mode in ("create", "unknown"):
         print(f"  gh release create {item.tag} --repo {args.repo} --draft "
               f"--title <...> --notes <...>")
-    elif item.upload_mode == "unknown":
-        print(f"  gh release create {item.tag} --repo {args.repo} --draft "
-              f"--title <...> --notes <...>  （release 不存在时）")
     print(f"  gh release view {item.tag} --repo {args.repo} --json databaseId,isDraft")
-    print(f"  curl -T <分卷> -X POST -H 'Content-Type: {CONTENT_TYPE}' -K - --fail "
-          f"'https://uploads.github.com/repos/{args.repo}/releases/<id>/assets?name=<分卷名>'"
-          f"  （--jobs {args.jobs} 并发）")
+    if args.upload_local:
+        print(f"  curl -T <分卷> -X POST -H 'Content-Type: {CONTENT_TYPE}' -K - --fail "
+              f"'https://uploads.github.com/repos/{args.repo}/releases/<id>/assets?name=<分卷名>'")
+        print(f"  gh release upload {item.tag} <分卷> --repo {args.repo} --clobber")
+    else:
+        print(f"  {GRP_NAME} <分卷> --repo {args.repo} --tag {item.tag}")
     if item.upload_mode != "upload" or item.is_draft:
         print(f"  gh release edit {item.tag} --repo {args.repo} --draft=false")
 
 
 def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.Namespace,
                index_changes: dict[Path, str], ledger_changed: bool) -> None:
-    print_items(items)
+    print_items(items, verbose=args.verbose or args.debug, dry_run=args.dry_run)
 
     print("\n计划写入：")
     for path in sorted(index_changes, key=lambda p: rel_posix(p, root)):
@@ -1058,13 +1268,16 @@ def print_plan(items: list[Item], todo: list[Item], root: Path, args: argparse.N
     if ledger_changed:
         print(f"  - {LEDGER_NAME}（记录 {len(todo)} 条发布账）")
 
-    print("\n将执行：")
-    rels = sorted({rel_posix(p, root) for p in index_changes} | ({LEDGER_NAME} if ledger_changed else set()))
-    print(f"  git -C {shq(root)} add -- {' '.join(shq(r) for r in rels)}")
-    print(f"  git -C {shq(root)} commit -F <提交信息> -- {' '.join(shq(r) for r in rels)}")
-    print(f"  git -C {shq(root)} push origin {args.branch}")
-    for item in todo:
-        print_upload_plan(item, args)
+    if args.verbose or args.debug:
+        # 命令清单只在 --verbose 里出现：平时给人看的是计划摘要，不是一堆命令行。
+        print("\n将执行（--verbose）：")
+        rels = sorted({rel_posix(p, root) for p in index_changes}
+                      | ({LEDGER_NAME} if ledger_changed else set()))
+        print(f"  git -C {shq(root)} add -- {' '.join(shq(r) for r in rels)}")
+        print(f"  git -C {shq(root)} commit -F <提交信息> -- {' '.join(shq(r) for r in rels)}")
+        print(f"  git -C {shq(root)} push origin {args.branch}")
+        for item in todo:
+            print_upload_plan(item, args)
 
 
 def build_commit_message(todo: list[Item]) -> str:
@@ -1109,8 +1322,9 @@ def build_commit_message(todo: list[Item]) -> str:
 def fetch_release_id(repo: str, tag: str) -> tuple[int | None, bool, str]:
     """取 release 的 databaseId（curl 上传要用）+ isDraft。只读。"""
     try:
-        proc = run(["gh", "release", "view", tag, "--repo", repo,
-                    "--json", "databaseId,isDraft"])
+        proc, _tries = _gh_retry(["gh", "release", "view", tag, "--repo", repo,
+                                  "--json", "databaseId,isDraft"],
+                                 label="release view")
     except ToolError as exc:
         return None, False, str(exc)
     if proc.returncode != 0:
@@ -1241,10 +1455,56 @@ def _gh_upload(args: argparse.Namespace, item: Item, part: ArchivePart) -> tuple
     return True, ""
 
 
+def _print_grp_hint() -> None:
+    print(f"  排错入口：{GRP_NAME} --check"
+          f"（服务器连通性 / 服务器上的 gh / gh auth status 三项体检）")
+
+
+def _grp_upload(args: argparse.Namespace, item: Item, part: ArchivePart,
+                forward: bool) -> tuple[bool, str]:
+    """单个分卷交给 `github_release_push`（它自己 scp+ssh；一个分卷一个进程）。
+
+    命令用它的 `--repo/--tag` 形式，**不拼 URL 字符串**（tag 里的字符转义是它的事）。
+    `forward=True`（`--jobs 1` 且是终端）时把它的 stderr 直接接到终端 —— scp 进度条
+    由它自己画，那正是这时候要给人看的东西；stdout 收下来丢掉，只留我们自己那行摘要。
+    并发（forward=False）时 stdout / stderr 都收下来，成功只留摘要、失败带最后几行。
+    """
+    exe = find_github_release_push()
+    if not exe:
+        return False, grp_missing_message()
+    cmd = [exe, str(part.path), "--repo", args.repo, "--tag", item.tag]
+    debug(" ".join(shlex.quote(c) for c in cmd))
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=None if forward else subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        return False, f"找不到 {exe}：{exc}"
+    if proc.returncode == 0:
+        debug(f"{GRP_NAME} 成功：{part.name}（{elapsed_text(time.monotonic() - started)}）")
+        return True, ""
+    if forward:
+        # stderr 已经直接打在终端上了，不用再重复贴一遍
+        return False, f"{GRP_NAME} 退出码 {proc.returncode}（报错见上面的输出）"
+    detail = tail_lines(proc.stderr or "", 5) or tail_lines(proc.stdout or "", 5)
+    return False, detail or f"{GRP_NAME} 退出码 {proc.returncode}"
+
+
 def _upload_one(args: argparse.Namespace, item: Item, part: ArchivePart,
                 release_id: int, token: str, use_curl: bool,
                 force_gh: bool, progress_bar: bool) -> tuple[bool, str, str]:
-    """传一个分卷：优先 curl；没有 curl / 失败 / 需要覆盖时退回 gh --clobber。"""
+    """传一个分卷。
+
+    默认通道 = `github_release_push`（服务器中转）；
+    `--upload-local` = 优先 curl，没有 curl / 失败 / 需要覆盖时退回 `gh --clobber`。
+    """
+    if not args.upload_local:
+        ok, why = _grp_upload(args, item, part, forward=progress_bar)
+        return ok, why, "push"
     if use_curl and not force_gh:
         ok, why = _curl_upload(args, part, release_id, token, progress_bar)
         if ok:
@@ -1276,26 +1536,45 @@ def verify_remote_parts(args: argparse.Namespace, item: Item,
 
 def _publish_draft_if_needed(args: argparse.Namespace, item: Item,
                              is_draft: bool) -> tuple[bool, str]:
+    """草稿传完再发布。`gh release edit --draft=false` 会重试 3 次（网络抖动）。
+
+    三次都失败 → 明确报错，草稿**保留**，绝不假装成功。重跑 `gbb` 会把这本书
+    判成"草稿需补传"，再走一遍上传 + 发布（幂等）。
+    """
     if not is_draft:
         return True, ""
     print("  release 是草稿，上传完成后发布：gh release edit --draft=false")
-    edit = run(["gh", "release", "edit", item.tag, "--repo", args.repo,
-                "--draft=false"])
+    edit, tries = _gh_retry(["gh", "release", "edit", item.tag, "--repo", args.repo,
+                             "--draft=false"],
+                            label="release edit --draft=false")
     if edit.returncode != 0:
-        detail = (edit.stderr or edit.stdout).strip()
-        print(f"  失败：文件传上去了，但草稿没能发布：{detail or '（gh 没输出原因）'}")
-        print("  草稿没有公开，下载链接对别人仍然不可用；没有留半成品，重跑会再补。")
-        return False, f"草稿发布失败：{detail or 'gh 返回非 0'}"
+        detail = tail_lines((edit.stderr or edit.stdout or ""), 5)
+        print(f"  失败：文件传上去了，但草稿没能发布（gh 试了 {tries} 次）："
+              f"{detail or '（gh 没输出原因）'}")
+        print("  草稿没有公开，下载链接对别人仍然不可用；没有留半成品。")
+        print("  稍后重跑 ./gbb 就行：这本书会被判成「草稿需补传」，再发布一次（幂等）。")
+        return False, f"草稿发布失败（gh 试了 {tries} 次）：{detail or 'gh 返回非 0'}"
     print("  草稿已发布，下载链接现在可用了。")
     return True, ""
 
 
 def upload_archive(args: argparse.Namespace, item: Item, archive: ArchiveInfo,
                    release_id: int, is_draft: bool, token: str) -> tuple[bool, str]:
-    """把一个 release 的全部分卷传上去（并发），必要时发布草稿。"""
-    use_curl = bool(token) and shutil.which("curl") is not None
-    if not use_curl:
-        print("  没有 curl / 取不到 token，改用 gh release upload（没有进度条）")
+    """把一个 release 的全部分卷传上去（并发），必要时发布草稿。
+
+    默认通道 = `github_release_push`（每个分卷一个子进程，scp 到服务器、服务器
+    `gh release upload`）——本机不直连 GitHub，所以家里上行慢 / 网络抖动都不拖累。
+    `--upload-local` 才用旧的 curl -T / gh release upload 本机直传。
+    传完一律回读核对（`verify_remote_parts`），这一步不许省。
+    """
+    if args.upload_local:
+        use_curl = bool(token) and shutil.which("curl") is not None
+        if not use_curl:
+            print("  没有 curl / 取不到 token，改用 gh release upload（没有进度条）")
+    else:
+        use_curl = False
+        if find_github_release_push() is None:
+            return False, grp_missing_message()
 
     meta = fetch_remote_release(args.repo, item.tag)
     remote_assets = meta.assets if meta.state == "ok" else []
@@ -1314,8 +1593,9 @@ def upload_archive(args: argparse.Namespace, item: Item, archive: ArchiveInfo,
             done_bytes += part.size
             done_parts += 1
             continue
-        if asset is not None:
+        if asset is not None and args.upload_local:
             # 同名资产还在但大小不对：curl 新建会 422，直接走 gh --clobber。
+            # （github_release_push 自己就带 --clobber，不用特殊处理。）
             force_gh.add(part.name)
         pending.append(part)
 
@@ -1325,7 +1605,12 @@ def upload_archive(args: argparse.Namespace, item: Item, archive: ArchiveInfo,
         if done_parts:
             print(f"  {done_parts} 个分卷远端已在，只传缺的 {len(pending)} 个")
         tty = sys.stdout.isatty()
-        bar_mode = use_curl and args.jobs == 1 and tty and len(pending) > 0
+        if args.upload_local:
+            # 本机直传：只有 curl 才能在终端里画单文件进度条
+            bar_mode = use_curl and args.jobs == 1 and tty and len(pending) > 0
+        else:
+            # 服务器中转：--jobs 1 且是终端时转发 github_release_push 自己的 scp 进度
+            bar_mode = args.jobs == 1 and tty and len(pending) > 0
         started = time.monotonic()
         if bar_mode:
             for part in pending:
@@ -1336,7 +1621,11 @@ def upload_archive(args: argparse.Namespace, item: Item, archive: ArchiveInfo,
                     part.name in force_gh, progress_bar=True,
                 )
                 if not ok:
+                    print(f"  ✗ {part.name}：{why}")
+                    if not args.upload_local:
+                        _print_grp_hint()
                     return False, f"{part.name} 上传失败：{why}"
+                print(f"  ✓ {part.name}（{human_size_mb(part.size)}）")
             total = sum(part.size for part in pending)
             elapsed = time.monotonic() - started
             print(f"  已上传 {len(pending)} 个分卷 · 共 {human_size_mb(total)} · "
@@ -1351,6 +1640,7 @@ def upload_archive(args: argparse.Namespace, item: Item, archive: ArchiveInfo,
             ticker = threading.Thread(target=progress.ticker, args=(stop,), daemon=True)
             ticker.start()
             errors: list[tuple[str, str]] = []
+            done: list[ArchivePart] = []
             try:
                 with ThreadPoolExecutor(max_workers=args.jobs) as pool:
                     futures = {
@@ -1369,15 +1659,21 @@ def upload_archive(args: argparse.Namespace, item: Item, archive: ArchiveInfo,
                             ok, why = False, str(exc)
                         if ok:
                             progress.add(part.size)
+                            done.append(part)
                         else:
                             errors.append((part.name, why or "上传失败"))
             finally:
                 stop.set()
                 ticker.join(timeout=1.0)
                 progress.render(final=True, force=True)
+            # 汇总行收完再逐卷留一行摘要：每个分卷一行，不掺它自己的碎输出。
+            for part in sorted(done, key=lambda p: p.name):
+                print(f"  ✓ {part.name}（{human_size_mb(part.size)}）")
             if errors:
                 for name, why in errors:
                     print(f"  ✗ {name}：{why}")
+                if not args.upload_local:
+                    _print_grp_hint()
                 return False, f"{len(errors)} 个分卷上传失败"
 
     if is_draft:
@@ -1393,7 +1689,8 @@ def upload_archive(args: argparse.Namespace, item: Item, archive: ArchiveInfo,
 def do_uploads(args: argparse.Namespace, root: Path, todo: list[Item]) -> list[tuple[Item, str]]:
     """返回失败列表 [(item, 原因)]。"""
     failures: list[tuple[Item, str]] = []
-    token = gh_auth_token()
+    # 令牌只有本机直传（curl）才用得上；服务器中转那条路的 token 在服务器的 gh 里。
+    token = gh_auth_token() if args.upload_local else ""
     for num, item in enumerate(todo, 1):
         print(f"\n[{num}/{len(todo)}] {item.rel}")
         archive = item.archive_info
@@ -1431,26 +1728,40 @@ def do_uploads(args: argparse.Namespace, root: Path, todo: list[Item]) -> list[t
         release_id: int | None = None
         if mode == "create":
             print("  建 release（--draft，不带资产）")
-            create = run(["gh", "release", "create", item.tag, "--repo", args.repo,
-                          "--title", title, "--notes", notes, "--draft"])
+            create, _tries = _gh_retry(
+                ["gh", "release", "create", item.tag, "--repo", args.repo,
+                 "--title", title, "--notes", notes, "--draft"],
+                label="release create",
+            )
             if create.returncode != 0:
                 detail = (create.stderr or create.stdout).strip()
                 release_id, remote_draft, _detail = fetch_release_id(args.repo, item.tag)
-                if release_id is None:
+                exists = bool(re.search(r"already[_ ]exists|\b422\b", detail))
+                if release_id is None and exists and not args.upload_local:
+                    # release 已经在了（422），只是 gh 抖得取不到 id。服务器中转用不到
+                    # databaseId，别因为一次网络抖动中止整轮。
+                    print(f"  ⚠️ release 已经存在（{detail}），取不到 id 也无所谓，继续上传")
+                    mode = "upload"
+                elif release_id is None:
                     print(f"  失败：{detail or '（gh 没输出原因）'}")
                     failures.append((item, detail or "gh 返回非 0"))
                     break  # 多半是登录/权限/网络问题，后面的不再硬试
-                print("  release 已经存在了，改走上传（不重建）")
-                is_draft = is_draft or remote_draft
-                mode = "upload"
+                else:
+                    print("  release 已经存在了，改走上传（不重建）")
+                    is_draft = is_draft or remote_draft
+                    mode = "upload"
 
         if release_id is None:
             release_id, remote_draft, detail = fetch_release_id(args.repo, item.tag)
             if release_id is None:
-                print(f"  ⚠️ 取不到 release id（{detail}），没法定 curl 的上传地址")
-                failures.append((item, detail or "取不到 release id"))
-                break
-            is_draft = is_draft or remote_draft
+                if args.upload_local:
+                    print(f"  ⚠️ 取不到 release id（{detail}），没法定 curl 的上传地址")
+                    failures.append((item, detail or "取不到 release id"))
+                    break
+                # 服务器中转用不到 databaseId：gh 抖了 3 次也别因此中止整轮
+                print(f"  ⚠️ 取不到 release id（{detail}），服务器中转用不到它，继续上传")
+            else:
+                is_draft = is_draft or remote_draft
 
         ok, reason = upload_archive(args, item, archive, release_id, is_draft, token)
         if not ok:
@@ -2190,6 +2501,11 @@ def _main(args: argparse.Namespace) -> int:
         print("\n[dry-run] 没有写任何文件、没有压缩，也没有执行 git / gh 写命令。")
         return 0
 
+    if not args.upload_local and find_github_release_push() is None:
+        # 默认通道是服务器中转。命令找不到就**明确报错**，绝不静默退回本机直传
+        # （本机直传 0.16–0.23 MB/s，等于罚站）。放在写任何文件之前，失败不用回滚。
+        raise ToolError(grp_missing_message())
+
     print()
     if not confirm(
         f"确认按上面的计划修改 index.md、提交并推送到 {args.branch}？（共 {len(todo)} 个 PDF）",
@@ -2202,14 +2518,20 @@ def _main(args: argparse.Namespace) -> int:
     # 先把压缩/分卷做出来（复用上次失败留下的分卷），再写账本 —— 账本里要记
     # 分卷名和大小，之后规划阶段的远端核对才能按"名字 + 大小"验完整性。
     print("\n准备压缩分卷：")
+    compress_started = time.monotonic()
     try:
-        for item in todo:
-            print(f"  {item.rel}")
-            item.archive_info = prepare_archive(item.pdf, item.sha, item.mtime)
+        infos = prepare_archives(args, todo)
     except ToolError as exc:
         print(f"\n错误：{exc}")
         print("没有写 index.md / 账本，也没有提交或推送。")
         return 1
+    for item, info in zip(todo, infos):
+        item.archive_info = info
+    if len(todo) > 1:
+        total = sum(info.total_size for info in infos)
+        print(f"  压缩完成：{len(todo)} 本，共 {human_size_mb(total)}，"
+              f"用时 {elapsed_text(time.monotonic() - compress_started)}"
+              f"（并行 {min(args.jobs, len(todo))}）")
 
     originals: dict[Path, bytes | None] = {path: path.read_bytes() for path in index_changes}
     originals[ledger_path] = ledger_raw_before
@@ -2272,7 +2594,10 @@ def _main(args: argparse.Namespace) -> int:
     stage_paths(root, write_paths)
     message = build_commit_message(todo)
     commit_hash = git_commit(root, write_paths, message)
-    print(f"已提交：{commit_hash}")
+    if commit_hash:
+        print(f"已提交：{commit_hash}")
+    else:
+        print("index.md 与账本没有实际变化，跳过提交（直接上传）")
 
     if not git_push(root, args.branch):
         print_git_hints(root, args.branch)
@@ -2296,7 +2621,10 @@ def _main(args: argparse.Namespace) -> int:
         print("\n==== 上传失败 ====")
         for item, reason in failures:
             print(f"  - {item.rel}（tag {item.tag}）：{reason}")
-        print_gh_troubleshooting(args.repo)
+        if args.upload_local:
+            print_gh_troubleshooting(args.repo)
+        else:
+            print_push_troubleshooting()
         print("现在回滚本次对 index.md 和账本的改动，避免留下指向空 release 的链接……")
         rollback(root, originals, args.branch, "release 上传失败")
         print("临时目录保留着：修好后重跑 ./gbb 会复用已经做好的分卷，不重新压缩。")

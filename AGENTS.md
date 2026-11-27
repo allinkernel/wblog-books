@@ -20,9 +20,10 @@ PDF 资料仓。PDF 本体**不进 git**（`.gitignore` 里有 `*.pdf`），由 
 ### 数据流
 
 ```
-扫描(scwd/--all) → 找归属 index.md → 算 sha256+mtime → 更新判据 → 远端核对(gh release view)
-   → 打印计划/询问 → 压缩+分卷(tar/split) → 写 index.md + .books-releases.json
-   → git add/commit/push → 询问 → 并发 curl 上传分卷 → 发布草稿 → 回读核对 → 清理临时目录
+扫描(scwd/--all) → 找归属 index.md → 算 sha256+mtime → 更新判据 → 远端核对(gh release view，失败重试 3 次)
+   → 打印计划/询问 → 并行压缩+分卷(tar/split，xz 按并发分核) → 写 index.md + .books-releases.json
+   → git add/commit/push → 询问
+   → 并发调 github_release_push 上传分卷（服务器中转） → 发布草稿 → 回读核对 → 清理临时目录
 ```
 
 `--pull` 是另一条路：`index.md` 托管块（+ 账本补全 sha256）→ `gh release view` 列资产
@@ -48,11 +49,14 @@ PDF 资料仓。PDF 本体**不进 git**（`.gitignore` 里有 `*.pdf`），由 
 | `make_tag` / `used_tags` | 生成 `<目录名>__<文件名>__<YYYYMMDD-HHMM>`，避让已有 tag |
 | `check_remote_book` / `classify_book_assets` | 只读核对：release / 草稿 / 分卷形态 / 分卷名与大小 |
 | `prepare_archive` / `load_archive_manifest` | 压缩 + 分卷；sha256+mtime 对得上就复用已有分卷 |
+| `prepare_archives` / `_xz_threads` / `xz_program` | 本轮多本**并行压缩**（`--jobs`）；xz 按并发分核（`-T<k>`，只压一本时 `-T0`） |
 | `render_block` / `parse_block_items` / `replace_block` | 渲染/解析/替换 `index.md` 托管块 |
-| `upload_archive` / `_curl_upload` / `_gh_upload` | 分卷并发上传；curl 优先，失败退 `gh release upload --clobber` |
+| `find_github_release_push` / `grp_missing_message` | 找默认上传通道（PATH → `~/self/wtool/.../bin/`）；找不到就明确报错，**不退回本机直传** |
+| `_gh_retry` | `gh` 只读调用重试 3 次（间隔 2s / 4s）；4xx（除 408/429）不重试 |
+| `upload_archive` / `_grp_upload` / `_curl_upload` / `_gh_upload` | 分卷并发上传：默认 `github_release_push`；`--upload-local` 才 curl 优先、失败退 `gh release upload --clobber` |
 | `UploadProgress` | 并发时的汇总进度行（只统计已完成分卷） |
-| `verify_remote_parts` | 传完回读远端，逐个核对分卷名与大小 |
-| `_publish_draft_if_needed` | 草稿传完再 `gh release edit --draft=false` |
+| `verify_remote_parts` | 传完回读远端，逐个核对分卷名与大小（**两条路都保留**） |
+| `_publish_draft_if_needed` | 草稿传完再 `gh release edit --draft=false`（重试 3 次；不成功就报错、留草稿） |
 | `rollback` | 上传失败 / 选择不上传时，把 index.md 与账本回滚并再提交推送 |
 | `collect_pull_records` | 以 `index.md` 托管块为准收集记录，账本补全 sha256 / 大小 |
 | `run_pull_job` / `install_downloaded` | 并发下载 → 校验分卷 → 拼接/解压 → 校验 sha256 → 落盘 |
@@ -76,6 +80,9 @@ PDF 资料仓。PDF 本体**不进 git**（`.gitignore` 里有 `*.pdf`），由 
 - **用户选择暂不上传**：同上回滚。
 - **传完回读核对失败**（网络）：只警告，不判上传失败；**release 里真的缺分卷**才判失败。
 - **Ctrl-C**：来不及回滚，账本可能谎报"已上传" → 下次默认远端核对会发现并补传。
+- **账本 index.md 没有实际变化时跳过提交**（`git_commit` 返回 `None`）：账本里唯一会变的
+  是 `uploaded_at`（精确到秒），同一秒内重跑就一模一样；旧版会把空提交当"提交失败"整轮中止。
+  跳过提交后照常进入上传。
 
 ### `--pull` 流程
 
@@ -169,13 +176,19 @@ PDF 资料仓。PDF 本体**不进 git**（`.gitignore` 里有 `*.pdf`），由 
 
 ## 压缩 / 分卷 / 临时目录
 
-- 压缩（**保留原名**，解压后文件名不变）：
+- 压缩（**保留原名**，解压后文件名不变），**本轮多本并行压**（`prepare_archives`）：
 
   ```sh
-  tar -C <pdf 所在目录> --use-compress-program='xz -6 -T0' -cf <pdf>.tar.xz -- <pdf>
+  tar -C <pdf 所在目录> --use-compress-program='xz -6 -T<k>' -cf <pdf>.tar.xz -- <pdf>
   ```
 
-  优先 `--use-compress-program`（xz 多线程 `-T0`）；不要用 `-9`（太慢）。
+  - `k = max(1, cpu_count // jobs_actual)`，`jobs_actual = min(--jobs, 待压缩本数)`；
+    `--jobs 1`（或只压一本）时用 `-T0` 吃满全核。
+  - ⚠️ **N 个 `xz -T0` 会互相抢核，反而比串行还慢** —— 并行时一定要分核，别改回 `-T0`。
+  - 任一本压缩失败 → **整轮中止**（不写 index.md / 账本、不提交、不上传），报出是哪一本。
+  - 每本一行 `压缩完成：xx.x MB，用时 y.y 秒`（并行时带 `[文件名] ` 前缀，顺序可能交错）；
+    压多本时最后再汇总一行 `压缩完成：5 本，共 124.0 MB，用时 18.3 秒（并行 4）`。
+  - 不要用 `-9`（太慢）。
 - 分卷：`.tar.xz` **> 10 MiB** 才切，`split -b 10M -d -a 2 <tar.xz> <tar.xz>.part.`，
   得到 `.part.00 .part.01 …`，每个 ≤ 10 MiB。`<tar.xz>` 本身仍留在临时目录里。
 - 临时目录 = PDF 同目录的 `.<pdf>.gbb_tar_dir/`（例 `.ABC.pdf.gbb_tar_dir`），里面：
@@ -218,35 +231,60 @@ gh release view <tag> --repo <repo> --json tagName,assets,isDraft
 - 核对失败**不许静默跳过**。`--no-verify` 是明确"跳过远端核对、只信本地账本"（默认关）；
   账本 `last_remote_state` 不是 `published` 时，`--no-verify` 会提示"上次可能是草稿/未知"。
 
-## 上传：压缩产物 + 并发 curl
+## 上传：默认 `github_release_push`（服务器中转）
 
-1. **先确认，再压缩**：计划打印完、用户确认"修改 index.md 并推送"之后，才 `prepare_archive`
-   做压缩/分卷。**账本必须在压缩之后写**（要记 `archive.parts` 的名字和大小）；
-   顺序仍是 **写 index.md + 账本 → commit → push → 上传**。
-2. **建 release**：新建时 `gh release create <tag> --repo <repo> --draft --title … --notes …`
-   （空草稿，不带资产）；补传时 release 已存在，直接取 id：
-   `gh release view <tag> --json databaseId,isDraft` → `.databaseId`。
-3. **并发上传分卷**（`--jobs`，默认 4；线程池）：
+1. **先确认，再压缩**：计划打印完、用户确认"修改 index.md 并推送"之后，才
+   `prepare_archives` 做压缩/分卷（**多本并行**，见上节）。**账本必须在压缩之后写**
+   （要记 `archive.parts` 的名字和大小）；顺序仍是
+   **写 index.md + 账本 → commit → push → 上传**。
+2. **建 release 仍由 gbb 做**：新建时 `gh release create <tag> --repo <repo> --draft
+   --title … --notes …`（空草稿，不带资产）；补传时 release 已存在，取
+   `gh release view <tag> --json databaseId,isDraft`。两次都走 `_gh_retry`；
+   create 报 422（已存在）且取不到 id 时，服务器中转那条路会继续上传（它用不到 databaseId）。
+3. **并发上传分卷**（`--jobs`，默认 4；线程池，**一个分卷一个子进程**）：
 
    ```sh
-   curl -T <part> -X POST -H 'Content-Type: application/octet-stream' -K - --fail \
-        'https://uploads.github.com/repos/<repo>/releases/<id>/assets?name=<归一化分卷名>'
+   github_release_push <分卷文件> --repo <owner/repo> --tag <tag>
    ```
 
-   - 目标域名是 **uploads.github.com**，不是 api.github.com。
-   - **token 红线**：token 由 `gh auth token` 读出，只写成 curl 配置文件
-     `header = "Authorization: token <token>"`，通过 **`-K -` 从 stdin** 喂进去。
-     **绝不许进 curl 的 argv**（`ps` / shell 历史 / 日志都会漏）。
-   - `--fail` 必须有：不加的话 HTTP 4xx/5xx 时 curl 退出码仍是 0，会被误判成成功。
-   - **并发时不画单文件进度条**（会打架）：用 `-sS`，改画一行汇总，每 2 秒 `\r` 刷新：
-     `已完成 3/11 个分卷 · 已传 31.5 MB / 101.6 MB · 1.2 KB/s`；非 TTY 每 10 秒一行。
-   - `--jobs 1` 且是终端 → 每个分卷一条 `curl --progress-bar` 真实进度条。
+   - **用它的 `--repo/--tag` 形式，不拼 release URL**（tag 里的字符转义是它的事）。
+   - 它自己 scp 到服务器、服务器 `gh release upload --clobber`、回读资产 size；
+     **本机不直连 GitHub**，所以家里上行慢 / 本机 `gh` 抖都不拖累上传。
+   - 输出收敛：成功只留 `✓ <分卷名>（xx.x MB）`；失败取它 stderr 最后 5 行，并提示
+     `github_release_push --check`。
+   - **并发时不画单文件进度条**：用一行汇总（每 2 秒 `\r` 刷新，非 TTY 每 10 秒一行），
+     全部分卷收完再逐卷打 `✓` 行：
+     `已完成 3/11 个分卷 · 已传 31.5 MB / 101.6 MB · 1.2 MB/s`
+   - `--jobs 1` 且是终端 → 子进程 stderr 直接继承，**转发它自己的 scp 进度条**
+     （stdout 仍然收掉，只留摘要）。
    - **进度只能来自"已完成分卷数/字节"**，不许编造"正在传多少"。
-4. **回退**（自动，不询问）：没有 curl / 取不到 token / curl 失败 / 同名资产大小不对 →
-   该分卷改用 `gh release upload <tag> <part> --repo <repo> --clobber`（没有进度条）。
-   远端已有且大小相同的分卷直接跳过（续传）。
-5. **传完**：草稿 → `gh release edit <tag> --draft=false`；再 `verify_remote_parts`
-   回读远端逐个核对分卷名 + 大小；最后清理临时目录（`--keep-temp` 保留）。
+   - 远端已有且大小相同的分卷直接跳过（续传）。
+4. **传完**：草稿 → `gh release edit <tag> --draft=false`（重试 3 次；三次都失败就
+   **报错、非 0、草稿留着** —— 重跑会被判成"草稿需补传"，幂等）；再 `verify_remote_parts`
+   回读远端逐个核对分卷名 + 大小（**这一步由 gbb 自己做，不依赖 github_release_push**）；
+   最后清理临时目录（`--keep-temp` 保留）。
+5. **`--upload-local`**（降级路径，默认**不用**）：本机直传 —— `curl -T` 优先
+   （token 只写进 `-K -` 的 stdin 配置，**绝不进 argv**；`--fail` 必须有），
+   没有 curl / 取不到 token / 失败 / 同名资产大小不对 → 该分卷退
+   `gh release upload --clobber`。实测本机直传 0.16–0.23 MB/s。
+6. **找不到 `github_release_push`**（`PATH` 和
+   `~/self/wtool/tools/github-release-push/bin/github_release_push` 都没有）→
+   在写任何文件之前就**明确报错**并给安装提示
+   （`wtool install tools/github-release-push`，或直接用那个路径），
+   **不许静默退回本机直传**。
+
+## `gh` 抖动：重试 3 次（`_gh_retry`）
+
+本机 `gh` 偶发 `EOF`（Clash TUN 把 `api.github.com` 解析成 `198.18.0.x` 假 IP，
+**不是凭证问题**）。所以：
+
+- `gh release view`（远端核对 / 取 release id）、`gh release create`、
+  `gh release edit --draft=false` 全部走 `_gh_retry`：最多 3 次，间隔 2s / 4s，
+  重试成功打一行 `gh release view 重试后成功（第 3 次）`。
+- **4xx 不重试**（除 408 / 429）：权限 403、已存在 422、不存在 404 重试也没用。
+- 三次都失败时维持原语义：**远端核对失败 = 警告 + 按未上传处理并继续**（不中止整轮）；
+  `edit --draft=false` 失败 = 报错并用非 0 退出（草稿保留）。
+- 上传本身不受影响：`github_release_push` 走 ssh 到服务器，本机不连 GitHub。
 
 ## 旧版怎么找回（hash / mtime 变了 = 新 tag，旧 release 不删）
 
@@ -285,10 +323,12 @@ git show <旧提交>:<某个 index.md>      # 整份旧 index.md，复制旧 tag
 
 ## 红线
 
-- **传大文件优先用 `github_release_push`**（wtool 私有工具仓
-  `tools/github-release-push`）：本机直传 GitHub 实测 0.16–0.23 MB/s；
-  "慢 10× 以上"是用户口径，本轮实测的服务器中转/本机直传比值见该仓 `journal.md`
-  —— 别把 10× 写成本轮量到的数。
+- **上传默认走 `github_release_push`**（wtool 私有工具仓 `tools/github-release-push`：
+  先 scp 到服务器，再由服务器 `gh release upload`）：本机直传 GitHub 实测 0.16–0.23 MB/s，
+  所以默认通道是服务器中转 —— 本机不直连 GitHub，**不需要任何代理环境变量**
+  （别再往文档 / 提示里写代理）。`--upload-local` 才是本机直传。
+  "慢 10× 以上"是用户口径，本轮实测比值见该仓 `journal.md` —— 别把 10× 写成本轮量到的数。
+- **`--jobs` 同时管三件事**：并行压缩的本数、上传分卷的并发进程数、`--pull` 的下载线程数。
 
 - **别手改** `index.md` 里的 `books:downloads:begin … end` 块（会被整块覆盖）。
 - **别 `git add -A` / `git add .`**：只 add 脚本改过的那几个文件（脚本用的是 pathspec）。
@@ -299,7 +339,8 @@ git show <旧提交>:<某个 index.md>      # 整份旧 index.md，复制旧 tag
   要跑真流程就把 `gbb`+`tools/` 拷到 `/tmp` 夹具，用假 `git`（`push` 吞掉、其余转真 `git`）
   和假 `gh` / 假 `curl`（记录参数、按 tag 返回预设 JSON / 造资产）跑。
 - 别把 PDF 重新纳入 git；别在 `books/` 里 `git reset --hard` / `checkout --` 洗掉别人改动。
-- 上传失败时的排错教程由脚本打印（`gh auth status` / `repo` scope / 代理 / 403 长什么样）。
+- 上传失败的排错教程由脚本打印：默认通道打 `github_release_push --check`（服务器连通性 /
+  服务器上的 `gh` / `gh auth status`）；`--upload-local` 打 `gh auth status` / repo scope / 403 那一套。
 
 ## 怎么测
 
@@ -315,24 +356,38 @@ git -C books status --short
 
 夹具（不碰真仓）：
 
-1. 建 `/tmp/books-fixture/`，把 `gbb` 和 `tools/` 拷进去（脚本根 = `tools/` 的父目录），
-   `git init -b main` 并配一个本地 bare `origin`（或桩 `git`）。
-2. **压缩/分卷**：造 2 MB 与 25 MB 的**随机**内容 PDF（随机才压不小）→ 2 MB 只有
-   `.tar.xz`；25 MB 有 `.tar.xz` + ≥2 个 `.part.NN`，每个 ≤ 10485760 字节；
+1. 建 `/tmp/<夹具>/cases/<case>/`，把 `gbb` 和 `tools/` 拷进去（脚本根 = `tools/` 的父目录），
+   `git init -b main` + 本地 bare `origin`；PDF 与 `index.md` 自己造。
+   桩放在 PATH 最前面，用环境变量传状态文件路径。
+2. **压缩/分卷**：造 200 KB 与 10.6 MB 的**随机**内容 PDF（随机才压不小）→ 小的只有
+   `.tar.xz`；大的有 `.tar.xz` + ≥2 个 `.part.NN`，每个 ≤ 10485760 字节；
    `tar -xJf` 解回的**同名 PDF** sha256 与原文件一致。
-3. **更新判据**：`touch` 改 mtime（内容不变）→ `[变更：mtime 变了…]` 且 tag 与账本不同；
-   改内容 → `[变更：sha256 变了]`；都不变 → `[跳过]`（远端桩能核对通过才行）。
-4. **并发上传**：桩 `curl` 记开始/结束时间戳；`--jobs 4` 时至少 2 个 curl 时间重叠，
-   汇总行形如 `已完成 2/3 个分卷 · 已传 … / … · …/s`；`--jobs 1` 在 pty 下
-   （`script -qec`）每个分卷都带 `--progress-bar` 且串行。
-5. **续传**：桩 `curl` 失败 → 临时目录保留；重跑 → 打印"复用上次留下的分卷"且不再压缩。
-6. **无注释计划**：`--dry-run` 输出里不能有 `# 上传走 curl` / `# token 由` / `# 回退` /
-   `# 先建一个空 release` 这类说明性注释行。
-7. **`--pull`**（桩 `gh` 造资产）：`index.md` 3 行 + 账本 → 三本缺失；
-   分卷那本并发下载 3 个分卷 → 拼 → 解 → sha256 通过；
-   旧形态（单个 `.pdf` 资产）直接下载成功；分卷缺 1 个（只有 00、02）→ 报错、退出码非 0；
-   `git status` 里不能有 index.md / 账本改动；临时目录成功后清理。
-8. **发布流程**：假 `gh` 记住 create 的 release / 资产；连跑两次 → 第二次全部跳过；
+3. **并行压缩**：多本时打印 `并行压缩 N 本（--jobs 4，每本 xz -6 -T<k>）`，每本一行
+   `压缩完成：xx.x MB，用时 y.y 秒`，最后一行汇总 `压缩完成：N 本，共 …，用时 …（并行 N）`；
+   `--jobs 1` 时是 `串行压缩`、每本 `xz -6 -T0`。串行 / 并行各跑一次记真实数字。
+4. **默认上传通道**（桩 `github_release_push` 记 argv + 起止时间）：
+   每个分卷一次调用、argv 是 `<分卷> --repo <repo> --tag <tag>`（**不是** URL）；
+   `--jobs 4` 时两个进程的时间区间要重叠；每个分卷成功一行 `✓ <分卷名>（…）`；
+   桩返回非 0 → `gbb` 非 0 退出 + `rollback`（`git log` 里出现"回滚本次发布"、
+   index.md 复原、账本删掉）。
+5. **找不到命令**：`PATH` 收窄成只含 git/gh、`HOME` 指向空目录（兜底路径不存在）→
+   非 0 退出、"找不到 github_release_push" + `wtool install …` 提示，
+   而且**没写任何文件**、**没有**退回本机直传。
+6. **`--upload-local`**：桩 `curl` 记到 argv（`-T` / `--fail` / `uploads.github.com`）；
+   桩 `github_release_push` 一次都不该被调用。
+7. **`gh` 重试**（桩 `gh` 可注入 EOF）：前 2 次 EOF、第 3 次成功 → 整轮成功，
+   输出里有 `gh release view 重试后成功（第 3 次）`；3 次全 EOF → 远端核对按"未上传"处理、
+   整轮不中止；`edit --draft=false` 3 次全失败 → 非 0 + 报错 + 草稿仍在。
+8. **输出收敛**：`--dry-run` 输出里 `grep -cE 'tar -C|split -b|gh release|curl -T|git -C|将执行'`
+   = 0；加 `--verbose` 才出现命令行。
+9. **更新判据 / 续传 / `--pull` / 发布流程**（沿用）：
+   `touch` 改 mtime（内容不变）→ `[变更：mtime 变了…]` 且 tag 与账本不同；
+   改内容 → `[变更：sha256 变了]`；都不变 → `[跳过]`；
+   桩上传失败 → 临时目录保留、重跑打印"复用上次留下的分卷"且不再压缩；
+   `--pull`：`index.md` 3 行 + 账本 → 三本缺失，分卷那本并发下载→拼→解→sha256 通过，
+   旧形态（单个 `.pdf` 资产）直接下载成功，分卷缺 1 个（只有 00、02）→ 报错非 0，
+   `git status` 里不能有 index.md / 账本改动；
+   `gh` 记住 create 的 release / 资产，连跑两次 → 第二次全部跳过；
    改 PDF → 新 tag、旧 tag 进 `previous`、旧 release 仍在（桩不删）。
-9. **推送/上传序列**：断言日志顺序 `add → commit → push → release create`；
-   失败路径用返回 1 的假 `gh`，断言打印排错教程且退出码非 0。
+10. **上传序列**：断言日志顺序 `add → commit → push → release create`；
+    失败路径断言打印排错教程（默认 `github_release_push --check`）且退出码非 0。
