@@ -100,6 +100,25 @@
 5. 传完再 `gh release edit --draft=false` 把草稿发布出去，并回读远端核对
    每个分卷的名字和大小。
 
+## 以后都用 `github_release_push` 传
+
+新增/更新分卷时，**不要再从本机直传 GitHub**（实测 0.16–0.23 MB/s）。
+用 wtool 的私有工具
+[`tools/github-release-push`](https://github.com/allinkernel/wtool-github-release-push)：
+
+```sh
+github_release_push <分卷文件> <release-URL>
+
+# 例：这本 PDF 的所有分卷
+for f in ".我的书.pdf.gbb_tar_dir/"*.part.*; do
+  github_release_push "$f" \
+    "https://github.com/allinkernel/wblog-books/releases/tag/<tag>"
+done
+```
+
+同名资产会被覆盖；传完会回读远端核对大小（有 sha256 时一起核）。
+装法、首次配置（服务器 + `gh` + 公钥）见那个仓的 `README.md` / `wtool-doc`。
+
 ## 下载缺失的 PDF（`--pull`）
 
 `./gbb --pull` **以 `index.md` 的托管块为准**（账本补全 sha256），找出**当前目录范围内**

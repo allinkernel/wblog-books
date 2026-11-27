@@ -285,6 +285,11 @@ git show <旧提交>:<某个 index.md>      # 整份旧 index.md，复制旧 tag
 
 ## 红线
 
+- **传大文件优先用 `github_release_push`**（wtool 私有工具仓
+  `tools/github-release-push`）：本机直传 GitHub 实测 0.16–0.23 MB/s；
+  "慢 10× 以上"是用户口径，本轮实测的服务器中转/本机直传比值见该仓 `journal.md`
+  —— 别把 10× 写成本轮量到的数。
+
 - **别手改** `index.md` 里的 `books:downloads:begin … end` 块（会被整块覆盖）。
 - **别 `git add -A` / `git add .`**：只 add 脚本改过的那几个文件（脚本用的是 pathspec）。
 - **agent 不许在真仓跑 `books/gbb` 的写流程**：正常流程会 `git push` +
