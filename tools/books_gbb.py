@@ -1997,10 +1997,17 @@ def _main(args: argparse.Namespace) -> int:
             f"    git -C {root} push -u origin {args.branch}"
         )
     if current != args.branch:
-        raise ToolError(
-            f"当前在分支 {current}，不是 {args.branch}。\n"
-            f"  请先：git -C {root} checkout {args.branch}"
-        )
+        # 用户 2026-11-27：不要在"分支不对"上报错停下 —— 直接切回目标分支。
+        # 切不过去（工作树有冲突）才报错。后续不再用 ds_dev 这类工作分支。
+        r = run(["git", "-C", root, "checkout", args.branch])
+        if r.returncode != 0:
+            raise ToolError(
+                f"当前在分支 {current}，不是 {args.branch}，而且切不过去：\n"
+                f"  {(r.stderr or r.stdout).strip()}\n"
+                f"  请先手工处理：git -C {root} checkout {args.branch}"
+            )
+        print(f"（当前在分支 {current}，已自动切到 {args.branch}）")
+        current = args.branch
 
     ledger_raw_before = ledger_path.read_bytes() if ledger_path.exists() else None
 
