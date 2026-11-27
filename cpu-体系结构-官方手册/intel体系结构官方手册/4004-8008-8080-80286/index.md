@@ -82,12 +82,3 @@
 
 1. **看编码粒度怎么变**：4004 的专用短指令 → 8008/8080 偏八进制（`DDD`/`SSS`）的紧凑单字节 Opcode → 8086 引入 `ModR/M` + `Group` 扩展字节 → 80386 引入 32 位操作数/地址尺寸前缀与 `0F` 双字节转义扩展 → x86-64 引入 `REX` 前缀扩展寄存器与 64 位宽度。
 2. **看指令集如何为系统软件让步**：对比 8086 纯应用/实模式指令与 80286 / 80386 新增的系统控制指令（如描述符表加载、特权检查、分页/控制寄存器操作），就能把“硬件指令集是怎么被操作系统逼出来的”这条线彻底串起来。
-
-<!-- books:downloads:begin （由 books/gbb 自动生成，别手改这块） -->
-# 下载链接
-1. [210498-005_80286_and_80287_Programmers_Reference_Manual_1987.pdf](https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__210498-005_80286_and_80287_Programmers_Reference_Manual_1987__20261127-1429) · 27.9 MB · sha256:ad487ba9 · 2026-11-27 13:51
-2. [98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509.pdf](https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__98-153B_Intel_8080_Microcomputer_Systems_Users_Manual_197509__20261127-1429) · 43.0 MB · sha256:d5982f96 · 2026-11-27 13:50
-3. [98-153D__MCS-80_Users_Manual_Oct77.pdf](https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__98-153D__MCS-80_Users_Manual_Oct77__20261127-1429) · 39.0 MB · sha256:7b4dce9e · 2026-11-27 13:50
-4. [MCS-40_Users_Manual_Nov74.pdf](https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__MCS-40_Users_Manual_Nov74__20261127-1429) · 7.4 MB · sha256:fe37193f · 2026-11-27 13:49
-5. [MCS-4_Assembly_Language_Programming_Manual_Dec73.pdf](https://github.com/allinkernel/wblog-books/releases/tag/4004-8008-8080-80286__MCS-4_Assembly_Language_Programming_Manual_Dec73__20261127-1429) · 5.2 MB · sha256:a3ebc56c · 2026-11-27 13:49
-<!-- books:downloads:end -->
